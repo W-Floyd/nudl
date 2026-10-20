@@ -851,6 +851,13 @@ impl NuClient {
         index: u32,
         start: u64,
     ) -> Result<impl Stream<Item = reqwest::Result<Bytes>>> {
+        // A zero-byte file has nothing to fetch. Some servers answer a Range request
+        // for one with 416, and their HEAD response carries no Content-Length to
+        // tell the check below that it is complete.
+        if file.download_size() == 0 {
+            return Err(Error::AlreadyComplete);
+        }
+
         let url = format!("{}/{}", firmware.base_url, file.download_remote_path(index));
         debug!("Requesting bytes {start}- from: {url}");
 

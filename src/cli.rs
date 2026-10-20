@@ -379,6 +379,10 @@ pub struct SyncCli {
     #[arg(short, long)]
     pub region: Vec<String>,
 
+    /// Model IDs to sync (as `nudl list` shows them). Default: all.
+    #[arg(short, long, value_name = "ID")]
+    pub model: Vec<String>,
+
     /// Scratch tier for downloads, as `PATH` or `PATH:CAP_GIB`. May be repeated.
     ///
     /// Tried in order: a file is downloaded into the first tier with room for it
@@ -418,6 +422,11 @@ pub struct SyncCli {
     /// Plan and report what would be downloaded, then stop.
     #[arg(long)]
     pub plan: bool,
+
+    /// Threads writing manifests and linking files already archived, in the
+    /// background. More hide the latency of a slow archive filesystem.
+    #[arg(long, value_name = "N", default_value_t = 32)]
+    pub setup_threads: usize,
 
     /// Manifests fetched at once while planning.
     #[arg(long, value_name = "N", default_value_t = 16)]

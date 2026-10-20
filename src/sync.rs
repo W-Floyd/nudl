@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -154,6 +154,9 @@ async fn make_plan(cli: &SyncCli, root: &Path) -> Result<Plan> {
                 .await?;
 
             for car in cars {
+                if !cli.model.is_empty() && !cli.model.contains(&car.id) {
+                    continue;
+                }
                 let dest = root.join(brand_dir(brand)).join(&region).join(&car.id);
                 if car
                     .versions
@@ -588,42 +591,54 @@ fn finish_job(shared: &Shared, jid: usize, result: Result<()>) {
 /// Setup that doesn't gate the downloads: write each version's manifest, then link in
 /// the files the archive already holds. Runs beside the workers because the archive
 /// filesystem may be slow, and the scratch tiers don't depend on it.
-fn prepare(shared: &Shared, links: Vec<(usize, PathBuf, PathBuf)>) {
+fn prepare(shared: &Shared, links: Vec<(usize, PathBuf, PathBuf)>, threads: usize) {
     let n = shared.state.lock().unwrap().targets.len();
+    let (next_target, next_link) = (AtomicUsize::new(0), AtomicUsize::new(0));
 
-    for ti in 0..n {
-        if shared.stop.load(Ordering::Relaxed) {
-            return;
-        }
-        let todo = {
-            let st = shared.state.lock().unwrap();
-            let t = &st.targets[ti];
-            (t.remaining > 0 && !t.ver_written)
-                .then(|| (t.dest.clone(), t.car.clone(), t.fw.clone()))
-        };
-        if let Some((dest, car, fw)) = todo {
-            match write_ver(&dest, &car, &fw) {
-                Ok(()) => shared.state.lock().unwrap().targets[ti].ver_written = true,
-                Err(e) => warn!("{e:#}"),
-            }
-        }
-        shared.prep_done.fetch_add(1, Ordering::Relaxed);
-    }
+    // Each operation can wait seconds on a loaded array, so run many at once; they
+    // touch different directories and files.
+    std::thread::scope(|scope| {
+        for _ in 0..threads.max(1) {
+            scope.spawn(|| {
+                loop {
+                    let ti = next_target.fetch_add(1, Ordering::Relaxed);
+                    if ti >= n || shared.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let todo = {
+                        let st = shared.state.lock().unwrap();
+                        let t = &st.targets[ti];
+                        (t.remaining > 0 && !t.ver_written)
+                            .then(|| (t.dest.clone(), t.car.clone(), t.fw.clone()))
+                    };
+                    if let Some((dest, car, fw)) = todo {
+                        match write_ver(&dest, &car, &fw) {
+                            Ok(()) => shared.state.lock().unwrap().targets[ti].ver_written = true,
+                            Err(e) => warn!("{e:#}"),
+                        }
+                    }
+                    shared.prep_done.fetch_add(1, Ordering::Relaxed);
+                }
 
-    for (ti, src, dst) in links {
-        if shared.stop.load(Ordering::Relaxed) {
-            return;
+                loop {
+                    let li = next_link.fetch_add(1, Ordering::Relaxed);
+                    if li >= links.len() || shared.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let (ti, src, dst) = &links[li];
+                    let completion = match hard_link_into(src, dst) {
+                        Ok(()) => shared.state.lock().unwrap().landed(*ti, 1),
+                        Err(e) => {
+                            warn!("{e:#}");
+                            None
+                        }
+                    };
+                    mark_complete(shared, completion.into_iter().collect());
+                    shared.prep_done.fetch_add(1, Ordering::Relaxed);
+                }
+            });
         }
-        let completion = match hard_link_into(&src, &dst) {
-            Ok(()) => shared.state.lock().unwrap().landed(ti, 1),
-            Err(e) => {
-                warn!("{e:#}");
-                None
-            }
-        };
-        mark_complete(shared, completion.into_iter().collect());
-        shared.prep_done.fetch_add(1, Ordering::Relaxed);
-    }
+    });
 }
 
 async fn run_job(shared: &Shared, client: &Arc<NuClient>, jid: usize) -> Result<()> {
@@ -854,11 +869,12 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
 
     // Setup runs beside the workers, so a slow archive filesystem can't hold up
     // the downloads (which go to the scratch tiers first).
+    let setup_threads = cli.setup_threads;
     let prep = {
         let shared = shared.clone();
         tokio::task::spawn_blocking(move || {
             mark_complete(&shared, ready);
-            prepare(&shared, link_ops);
+            prepare(&shared, link_ops, setup_threads);
         })
     };
 
