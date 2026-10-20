@@ -10,12 +10,14 @@ mod download;
 mod link;
 mod model;
 mod progress;
+mod sync;
 mod verify;
 mod version;
 
 use std::{
     fmt::{self, Display, Write as _},
     io::{self, IsTerminal, Write},
+    sync::Arc,
     time::Duration,
 };
 
@@ -50,25 +52,32 @@ fn progress_style() -> ProgressStyle {
     .progress_chars("█▉▊▋▌▍▎▏  ")
 }
 
-async fn prepare_client(
-    brand: Brand,
-    region: Option<&str>,
-    network: &NetworkGroup,
-) -> Result<(NuClient, String, String)> {
+/// Build a client with the cache settings from `network`, sending requests through
+/// `proxies` (direct when empty).
+fn build_client(network: &NetworkGroup, proxies: Vec<String>) -> Result<NuClient> {
     let cache_dir = if network.no_cache {
         None
     } else {
         network.cache_dir.clone().or_else(default_cache_dir)
     };
-    let client = NuClientBuilder::new()
+
+    Ok(NuClientBuilder::new()
         .ignore_tls_validation(network.ignore_tls_validation)
-        .proxies(network.proxy.clone())
+        .proxies(proxies)
         .cache(cache_dir.map(|dir| Cache {
             dir,
             list_ttl: Duration::from_secs(network.cache_ttl_list),
             manifest_ttl: Duration::from_secs(network.cache_ttl_manifest),
         }))
-        .build()?;
+        .build()?)
+}
+
+async fn prepare_client(
+    brand: Brand,
+    region: Option<&str>,
+    network: &NetworkGroup,
+) -> Result<(NuClient, String, String)> {
+    let client = build_client(network, network.proxy.clone())?;
 
     let (autodetected, region) = match region {
         Some(r) => (false, r.to_owned()),
@@ -304,7 +313,7 @@ async fn download_subcommand(cli: &DownloadCli, bars: MultiProgress) -> Result<(
         .with_context(|| format!("Failed to open directory: {:?}", cli.output))?;
 
     if !cli.link_from.is_empty() {
-        let index = link::index(&cli.link_from, cli.link_min_size)?;
+        let index = link::index(&cli.link_from, cli.link_min_size, None)?;
         let linked = link::link_files(&index, &cli.output, &firmware, cli.link_min_size)?;
         debug!("Linked {linked} existing files");
     }
@@ -339,7 +348,7 @@ async fn download_subcommand(cli: &DownloadCli, bars: MultiProgress) -> Result<(
 
     let (downloader, mut p_rx) = Downloader::new(
         directory,
-        client,
+        Arc::new(client),
         car.clone(),
         firmware,
         cli.concurrency.0.into(),
@@ -469,5 +478,6 @@ async fn main() -> Result<()> {
         Command::List(c) => list_subcommand(c).await,
         Command::Download(c) => download_subcommand(c, bars).await,
         Command::Verify(c) => verify_subcommand(c, bars).await,
+        Command::Sync(c) => sync::run(c).await,
     }
 }

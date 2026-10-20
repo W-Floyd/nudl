@@ -359,11 +359,85 @@ pub struct VerifyCli {
     pub concurrency: Concurrency,
 }
 
+/// Keep an archive of firmware up to date.
+///
+/// Plans every pending firmware across brands and regions, downloads each distinct
+/// file once (files shared between versions are hardlinked), and keeps the
+/// download workers busy by scheduling per file, not per version. Safe to re-run
+/// or interrupt: finished versions are marked with `.complete`, partial files resume.
+#[derive(Debug, Parser)]
+pub struct SyncCli {
+    /// Archive directory. Layout: `<brand>/<region>/<model id>/<version>/`.
+    #[arg(long, value_name = "DIR")]
+    pub root: PathBuf,
+
+    /// Brands to sync. Default: all.
+    #[arg(short, long)]
+    pub brand: Vec<Brand>,
+
+    /// Regions to sync. Default: all known regions.
+    #[arg(short, long)]
+    pub region: Vec<String>,
+
+    /// Scratch tier for downloads, as `PATH` or `PATH:CAP_GIB`. May be repeated.
+    ///
+    /// Tried in order: a file is downloaded into the first tier with room for it
+    /// (capacity, free space, and for tmpfs the available RAM), so later tiers only
+    /// see overflow. Each finished file is moved into the archive at once. When no
+    /// tier fits, the file downloads straight into the archive.
+    #[arg(long, value_name = "PATH[:CAP_GIB]")]
+    pub stage: Vec<String>,
+
+    /// Files downloading at once. Workers take the proxies in turn.
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    pub workers: usize,
+
+    /// Connections per file.
+    ///
+    /// The maximum concurrency allowed is 16.
+    #[arg(short, long, default_value = "8")]
+    pub concurrency: Concurrency,
+
+    /// Maximum retries during download.
+    #[arg(long, default_value = "3")]
+    pub retries: u8,
+
+    /// Keep this much free on a stage tier (and of RAM, for tmpfs), in GiB.
+    #[arg(long, value_name = "GIB", default_value_t = 16)]
+    pub headroom_gb: u64,
+
+    /// Refuse to start if the new data would leave less than this free in the
+    /// archive, in GiB.
+    #[arg(long, value_name = "GIB", default_value_t = 200)]
+    pub min_free_gb: u64,
+
+    /// Start even if the archive filesystem would run low on space.
+    #[arg(long)]
+    pub ignore_space: bool,
+
+    /// Plan and report what would be downloaded, then stop.
+    #[arg(long)]
+    pub plan: bool,
+
+    /// Manifests fetched at once while planning.
+    #[arg(long, value_name = "N", default_value_t = 16)]
+    pub plan_jobs: usize,
+
+    /// Smallest file, in bytes, that is shared between versions. Smaller files
+    /// are downloaded per version, in one batch.
+    #[arg(long, value_name = "BYTES", default_value_t = 1_048_576)]
+    pub link_min_size: u64,
+
+    #[command(flatten)]
+    pub network: NetworkGroup,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     List(ListCli),
     Download(DownloadCli),
     Verify(VerifyCli),
+    Sync(SyncCli),
 }
 
 fn cli_additional_help() -> String {

@@ -196,6 +196,7 @@ impl Opener for SubdirOpener {
 pub struct Downloader {
     directory: Arc<Dir>,
     client: Arc<NuClient>,
+    write_version: bool,
     car: Arc<CarInfo>,
     firmware: Arc<FirmwareInfo>,
     concurrency: usize,
@@ -210,7 +211,7 @@ impl Downloader {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         directory: Dir,
-        client: NuClient,
+        client: Arc<NuClient>,
         car: CarInfo,
         firmware: FirmwareInfo,
         concurrency: usize,
@@ -223,7 +224,8 @@ impl Downloader {
 
         let result = Self {
             directory: Arc::new(directory),
-            client: Arc::new(client),
+            client,
+            write_version: true,
             car: Arc::new(car),
             firmware: Arc::new(firmware),
             concurrency,
@@ -850,17 +852,26 @@ impl Downloader {
         TaskResult::Move(Self::move_file(directory, mover, rel).await)
     }
 
+    /// Don't write `<id>.ver`. For callers that download part of a firmware and
+    /// manage the full manifest themselves.
+    pub fn without_version_file(mut self) -> Self {
+        self.write_version = false;
+        self
+    }
+
     pub async fn download(&self) -> Result<()> {
         // Write version info file. This is not cancellable because it's a
         // single write operation.
-        task::spawn_blocking({
-            let directory = self.directory.clone();
-            let car = self.car.clone();
-            let firmware = self.firmware.clone();
+        if self.write_version {
+            task::spawn_blocking({
+                let directory = self.directory.clone();
+                let car = self.car.clone();
+                let firmware = self.firmware.clone();
 
-            move || Self::write_version_file(&directory, &car, &firmware)
-        })
-        .await??;
+                move || Self::write_version_file(&directory, &car, &firmware)
+            })
+            .await??;
+        }
 
         let mut state = {
             let cancel_on_drop = CancelOnDrop::new();

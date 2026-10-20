@@ -11,7 +11,14 @@ use crate::{client::FirmwareInfo, version::VersionInfo};
 
 type Key = (u32, u64);
 
-fn collect_ver_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+/// Find `.ver` files under `dir`, descending at most `max_depth` directories
+/// (unlimited when `None`). Hidden directories (`.cas`, `.cache`) are skipped.
+fn collect_ver_files(
+    dir: &Path,
+    depth: usize,
+    max_depth: Option<usize>,
+    out: &mut Vec<PathBuf>,
+) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         // Not following symlinks keeps a loop in the archive from hanging the walk.
@@ -19,7 +26,10 @@ fn collect_ver_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
         let path = entry.path();
 
         if ty.is_dir() {
-            collect_ver_files(&path, out)?;
+            let hidden = entry.file_name().to_string_lossy().starts_with('.');
+            if !hidden && max_depth.is_none_or(|m| depth < m) {
+                collect_ver_files(&path, depth + 1, max_depth, out)?;
+            }
         } else if ty.is_file() && path.extension().is_some_and(|e| e == "ver") {
             out.push(path);
         }
@@ -31,10 +41,14 @@ fn collect_ver_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
 /// Map (CRC32, size) to an existing file, for every file listed in a `.ver`
 /// under `roots`. A file only exists at its final path once it is downloaded and
 /// verified, so presence plus a matching size is enough to trust the `.ver`.
-pub fn index(roots: &[PathBuf], min_size: u64) -> Result<HashMap<Key, PathBuf>> {
+pub fn index(
+    roots: &[PathBuf],
+    min_size: u64,
+    max_depth: Option<usize>,
+) -> Result<HashMap<Key, PathBuf>> {
     let mut vers = vec![];
     for root in roots {
-        collect_ver_files(root, &mut vers)
+        collect_ver_files(root, 0, max_depth, &mut vers)
             .with_context(|| format!("Failed to scan for version files: {root:?}"))?;
     }
 
