@@ -7,8 +7,11 @@ use std::{
     fs,
     path::PathBuf,
     str::{self, FromStr},
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
+    sync::{
+        LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -621,9 +624,20 @@ impl NuClientBuilder {
 pub struct NuClient {
     /// One client per proxy, or a single direct client.
     clients: Vec<Client>,
-    next: AtomicUsize,
     cache: Option<Cache>,
 }
+
+/// Where the next request goes among the proxies. Shared by every client in the
+/// process, so many short-lived clients (one per brand and region while planning)
+/// still spread evenly, and a random start keeps separate runs from all favouring the
+/// first proxy.
+static ROTATION: LazyLock<AtomicUsize> = LazyLock::new(|| {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+
+    AtomicUsize::new(nanos as usize)
+});
 
 impl NuClient {
     fn with_options(options: &NuClientBuilder) -> Result<Self> {
@@ -654,7 +668,6 @@ impl NuClient {
 
         Ok(Self {
             clients,
-            next: AtomicUsize::new(0),
             cache: options.cache.clone(),
         })
     }
@@ -662,7 +675,7 @@ impl NuClient {
     /// The client for the next request. Requests rotate through the proxies, so
     /// the parts of a download are spread across them.
     fn client(&self) -> &Client {
-        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        let i = ROTATION.fetch_add(1, Ordering::Relaxed) % self.clients.len();
 
         &self.clients[i]
     }
