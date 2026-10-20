@@ -233,6 +233,22 @@ pub struct DownloadCli {
     #[arg(short, long)]
     pub keep_raw: bool,
 
+    /// Write the `<id>.ver` manifest and exit without downloading.
+    #[arg(long)]
+    pub manifest_only: bool,
+
+    /// Hardlink files already downloaded elsewhere instead of fetching them.
+    ///
+    /// Every `.ver` file under DIR is read, and any file of this firmware with
+    /// the same CRC32 and size is linked into the output directory. May be
+    /// repeated. DIR must be on the same filesystem as the output.
+    #[arg(long, value_name = "DIR")]
+    pub link_from: Vec<PathBuf>,
+
+    /// Smallest file, in bytes, that `--link-from` will link.
+    #[arg(long, value_name = "BYTES", default_value_t = 1_048_576)]
+    pub link_min_size: u64,
+
     #[command(flatten)]
     pub network: NetworkGroup,
 }

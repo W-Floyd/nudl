@@ -7,6 +7,7 @@ mod client;
 mod constants;
 mod crypto;
 mod download;
+mod link;
 mod model;
 mod progress;
 mod verify;
@@ -290,6 +291,16 @@ async fn download_subcommand(cli: &DownloadCli, bars: MultiProgress) -> Result<(
         .with_context(|| format!("Failed to create directory: {:?}", cli.output))?;
     let directory = Dir::open_ambient_dir(&cli.output, authority)
         .with_context(|| format!("Failed to open directory: {:?}", cli.output))?;
+
+    if cli.manifest_only {
+        return Downloader::write_version_file(&directory, car, &firmware);
+    }
+
+    if !cli.link_from.is_empty() {
+        let index = link::index(&cli.link_from, cli.link_min_size)?;
+        let linked = link::link_files(&index, &cli.output, &firmware, cli.link_min_size)?;
+        debug!("Linked {linked} existing files");
+    }
 
     // The progress will be misreported if files are modified by external
     // processes. Solving this requires sending HEAD requests for each split and

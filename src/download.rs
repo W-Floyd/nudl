@@ -156,7 +156,7 @@ impl Downloader {
     }
 
     /// Write version info file to [`CarInfo::id`]`.ver`.
-    fn write_version_file(directory: &Dir, car: &CarInfo, firmware: &FirmwareInfo) -> Result<()> {
+    pub fn write_version_file(directory: &Dir, car: &CarInfo, firmware: &FirmwareInfo) -> Result<()> {
         let path = format!("{}.ver", car.id);
         let info = VersionInfo::new(car, firmware);
 
