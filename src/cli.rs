@@ -135,6 +135,44 @@ pub struct NetworkGroup {
     /// Ignore TLS certificate validation for HTTPS connections.
     #[arg(long)]
     pub ignore_tls_validation: bool,
+
+    /// Directory for cached car lists and firmware manifests.
+    ///
+    /// Defaults to `nudl` under the user cache directory ($XDG_CACHE_HOME, else
+    /// ~/.cache, or ~/Library/Caches on macOS).
+    #[arg(long, value_name = "DIR", env = "NUDL_CACHE_DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Do not read or write the cache.
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Seconds a cached car list stays valid. 0 refreshes it.
+    #[arg(long, value_name = "SECONDS", default_value_t = 21_600)]
+    pub cache_ttl_list: u64,
+
+    /// Seconds a cached firmware manifest stays valid. 0 refreshes it.
+    ///
+    /// A manifest is addressed by a per-version code, so it rarely changes.
+    #[arg(long, value_name = "SECONDS", default_value_t = 2_592_000)]
+    pub cache_ttl_manifest: u64,
+}
+
+/// Default cache location, if a home directory can be found.
+pub fn default_cache_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?);
+            Some(if cfg!(target_os = "macos") {
+                home.join("Library/Caches")
+            } else {
+                home.join(".cache")
+            })
+        })?;
+
+    Some(base.join("nudl"))
 }
 
 fn list_additional_help() -> String {

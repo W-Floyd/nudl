@@ -29,8 +29,11 @@ use tracing::debug;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    cli::{Brand, Cli, Command, DownloadCli, ListCli, OutputFormat, VerifyCli},
-    client::{CarInfo, NuClient, NuClientBuilder},
+    cli::{
+        Brand, Cli, Command, DownloadCli, ListCli, NetworkGroup, OutputFormat, VerifyCli,
+        default_cache_dir,
+    },
+    client::{Cache, CarInfo, NuClient, NuClientBuilder},
     download::Downloader,
     progress::{Osc94, Osc94Printer, ProgressSuspendingStderr, SpeedTracker, progress_percentage},
     verify::Verifier,
@@ -50,16 +53,31 @@ fn progress_style() -> ProgressStyle {
 async fn prepare_client(
     brand: Brand,
     region: Option<&str>,
-    ignore_tls_validation: bool,
+    network: &NetworkGroup,
 ) -> Result<(NuClient, String, String)> {
+    let cache_dir = if network.no_cache {
+        None
+    } else {
+        network.cache_dir.clone().or_else(default_cache_dir)
+    };
     let client = NuClientBuilder::new()
-        .ignore_tls_validation(ignore_tls_validation)
+        .ignore_tls_validation(network.ignore_tls_validation)
+        .cache(cache_dir.map(|dir| Cache {
+            dir,
+            list_ttl: Duration::from_secs(network.cache_ttl_list),
+            manifest_ttl: Duration::from_secs(network.cache_ttl_manifest),
+        }))
         .build()?;
 
     let (autodetected, region) = match region {
         Some(r) => (false, r.to_owned()),
         None => (true, client.get_region().await?),
     };
+
+    // A cached list needs neither region validation nor a GUID.
+    if client.has_cached_cars(&region, brand.as_code_str()) {
+        return Ok((client, region, String::new()));
+    }
 
     if let Err(e) = client.validate_region(brand.as_code_str(), &region).await {
         return if autodetected {
@@ -126,12 +144,8 @@ impl fmt::Display for Selector {
 }
 
 async fn list_subcommand(cli: &ListCli) -> Result<()> {
-    let (client, region, guid) = prepare_client(
-        cli.family.brand,
-        cli.family.region.as_deref(),
-        cli.network.ignore_tls_validation,
-    )
-    .await?;
+    let (client, region, guid) =
+        prepare_client(cli.family.brand, cli.family.region.as_deref(), &cli.network).await?;
     let brand = cli.family.brand.as_code_str();
     let selectors = cli.selector.to_selectors();
 
@@ -213,12 +227,8 @@ async fn list_subcommand(cli: &ListCli) -> Result<()> {
 }
 
 async fn download_subcommand(cli: &DownloadCli, bars: MultiProgress) -> Result<()> {
-    let (client, region, guid) = prepare_client(
-        cli.family.brand,
-        cli.family.region.as_deref(),
-        cli.network.ignore_tls_validation,
-    )
-    .await?;
+    let (client, region, guid) =
+        prepare_client(cli.family.brand, cli.family.region.as_deref(), &cli.network).await?;
 
     let cars = client
         .get_cars(&region, &guid, cli.family.brand.as_code_str())

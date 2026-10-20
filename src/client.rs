@@ -4,7 +4,10 @@
 use std::{
     borrow::Cow,
     fmt::{self, Debug},
+    fs,
+    path::PathBuf,
     str::{self, FromStr},
+    time::Duration,
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -93,6 +96,8 @@ pub enum Error {
     Crypto(#[from] crypto::Error),
     #[error("Model error: {0}")]
     Model(#[from] model::Error),
+    #[error("Failed to parse response: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -533,17 +538,59 @@ impl TryFrom<CarDownloadData> for FirmwareInfo {
     }
 }
 
+/// On-disk cache of API responses. The car list changes as firmware is released,
+/// so it expires; a firmware manifest is addressed by a per-version code and
+/// keeps for much longer.
+#[derive(Clone, Debug)]
+pub struct Cache {
+    pub dir: PathBuf,
+    pub list_ttl: Duration,
+    pub manifest_ttl: Duration,
+}
+
+impl Cache {
+    fn read(&self, key: &str, ttl: Duration) -> Option<Vec<u8>> {
+        let path = self.dir.join(key);
+        let age = fs::metadata(&path).ok()?.modified().ok()?.elapsed().ok()?;
+        if age > ttl {
+            return None;
+        }
+
+        fs::read(path).ok()
+    }
+
+    fn write(&self, key: &str, data: &[u8]) {
+        // The cache is an optimization; never fail a command over it.
+        let path = self.dir.join(key);
+        let tmp = path.with_extension("tmp");
+        let result = fs::create_dir_all(&self.dir)
+            .and_then(|()| fs::write(&tmp, data))
+            .and_then(|()| fs::rename(&tmp, &path));
+        if let Err(e) = result {
+            debug!("Failed to write cache entry {path:?}: {e}");
+        }
+    }
+}
+
 /// Builder type for [`NuClient`].
 #[derive(Clone)]
 pub struct NuClientBuilder {
     ignore_tls_validation: bool,
+    cache: Option<Cache>,
 }
 
 impl NuClientBuilder {
     pub fn new() -> Self {
         Self {
             ignore_tls_validation: false,
+            cache: None,
         }
+    }
+
+    /// Cache list and manifest responses on disk.
+    pub fn cache(mut self, value: Option<Cache>) -> Self {
+        self.cache = value;
+        self
     }
 
     /// Ignore TLS certificate validation when performing HTTPS requests. By
@@ -563,6 +610,7 @@ impl NuClientBuilder {
 /// Client for interacting with the NU service.
 pub struct NuClient {
     client: Client,
+    cache: Option<Cache>,
 }
 
 impl NuClient {
@@ -574,7 +622,58 @@ impl NuClient {
             .referer(false)
             .build()?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            cache: options.cache.clone(),
+        })
+    }
+
+    /// Like [`Self::exec`], but serves from and fills the cache under `key`.
+    /// `manifest` picks which TTL applies.
+    async fn exec_cached<T: Debug + DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        key: &str,
+        manifest: bool,
+    ) -> Result<T> {
+        let Some(cache) = &self.cache else {
+            return Self::exec(request).await;
+        };
+        let ttl = if manifest {
+            cache.manifest_ttl
+        } else {
+            cache.list_ttl
+        };
+
+        if let Some(bytes) = cache.read(key, ttl)
+            && let Ok(json) = serde_json::from_slice::<ResponseData<T>>(&bytes)
+            && json.error_for_status().is_ok()
+        {
+            debug!("Cache hit: {key}");
+            return Ok(json.data);
+        }
+
+        let response = request
+            .header(header::USER_AGENT, USER_AGENT)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let bytes = response.bytes().await?;
+        let json: ResponseData<T> = serde_json::from_slice(&bytes)?;
+        json.error_for_status()?;
+
+        cache.write(key, &bytes);
+
+        Ok(json.data)
+    }
+
+    /// Whether a fresh car list is cached, in which case neither region
+    /// validation nor a GUID is needed to get it.
+    pub fn has_cached_cars(&self, region: &str, brand: &str) -> bool {
+        self.cache
+            .as_ref()
+            .is_some_and(|c| c.read(&format!("cars-{region}-{brand}.json"), c.list_ttl).is_some())
     }
 
     async fn exec<T: Debug + DeserializeOwned>(request: RequestBuilder) -> Result<T> {
@@ -658,11 +757,13 @@ impl NuClient {
 
         let authorization = Authorization::new();
 
-        Self::exec(
+        self.exec_cached(
             self.client
                 .post(&url)
                 .header(header::AUTHORIZATION, authorization.to_string())
                 .json(&request_json),
+            &format!("cars-{region}-{brand}.json"),
+            false,
         )
         .await
     }
@@ -680,12 +781,21 @@ impl NuClient {
         let url = format!("{}/car/download/{}", base_url(region), car.code);
 
         let authorization = Authorization::new();
-        let data: CarDownloadData = Self::exec(
-            self.client
-                .get(&url)
-                .header(header::AUTHORIZATION, authorization.to_string()),
-        )
-        .await?;
+        // The code is a long token, so key on a checksum of it plus the readable id.
+        let key = format!(
+            "manifest-{region}-{}-{:08x}.json",
+            car.id,
+            crc32fast::hash(car.code.as_bytes()),
+        );
+        let data: CarDownloadData = self
+            .exec_cached(
+                self.client
+                    .get(&url)
+                    .header(header::AUTHORIZATION, authorization.to_string()),
+                &key,
+                true,
+            )
+            .await?;
 
         FirmwareInfo::try_from(data)
     }
