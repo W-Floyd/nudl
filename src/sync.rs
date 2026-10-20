@@ -597,6 +597,33 @@ async fn worker(shared: Arc<Shared>, client: Arc<NuClient>) {
     }
 }
 
+/// Hold `<root>/.sync.lock` for the life of the returned file, so two syncs of the
+/// same archive can't run at once.
+#[cfg(unix)]
+fn lock(root: &Path) -> Result<fs::File> {
+    use std::os::fd::AsRawFd;
+
+    let path = root.join(".sync.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("Failed to open {path:?}"))?;
+    // SAFETY: the descriptor is valid for as long as `file` is.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("Another sync of {root:?} is already running");
+    }
+
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn lock(root: &Path) -> Result<fs::File> {
+    let path = root.join(".sync.lock");
+
+    fs::File::create(&path).with_context(|| format!("Failed to create {path:?}"))
+}
+
 fn gb(bytes: u64) -> u64 {
     bytes / 1_000_000_000
 }
@@ -626,6 +653,9 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
         }
         fs::create_dir_all(&root).with_context(|| format!("Failed to create {root:?}"))?;
     }
+
+    // Planning only reads, so it can run beside a live sync; a real run takes the lock.
+    let _lock = if cli.plan { None } else { Some(lock(&root)?) };
 
     let plan = make_plan(cli, &root).await?;
     let free = report(&plan, &root);
