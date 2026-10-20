@@ -147,6 +147,14 @@ pub struct NetworkGroup {
     #[arg(long)]
     pub no_cache: bool,
 
+    /// Send requests through a proxy: http://, https://, socks5:// or socks5h://.
+    ///
+    /// May be repeated (or comma-separated in NUDL_PROXY); requests then rotate
+    /// through the proxies, which spreads a download's connections across them.
+    /// Credentials in the URL are never logged.
+    #[arg(long, value_name = "URL", env = "NUDL_PROXY", value_delimiter = ',')]
+    pub proxy: Vec<String>,
+
     /// Seconds a cached car list stays valid. 0 refreshes it.
     #[arg(long, value_name = "SECONDS", default_value_t = 21_600)]
     pub cache_ttl_list: u64,

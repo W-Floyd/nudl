@@ -62,6 +62,7 @@ async fn prepare_client(
     };
     let client = NuClientBuilder::new()
         .ignore_tls_validation(network.ignore_tls_validation)
+        .proxies(network.proxy.clone())
         .cache(cache_dir.map(|dir| Cache {
             dir,
             list_ttl: Duration::from_secs(network.cache_ttl_list),

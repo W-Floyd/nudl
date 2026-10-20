@@ -7,6 +7,7 @@ use std::{
     fs,
     path::PathBuf,
     str::{self, FromStr},
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -577,6 +578,7 @@ impl Cache {
 pub struct NuClientBuilder {
     ignore_tls_validation: bool,
     cache: Option<Cache>,
+    proxies: Vec<String>,
 }
 
 impl NuClientBuilder {
@@ -584,7 +586,15 @@ impl NuClientBuilder {
         Self {
             ignore_tls_validation: false,
             cache: None,
+            proxies: vec![],
         }
+    }
+
+    /// Send requests through these proxies (`http://`, `https://`, `socks5://` or
+    /// `socks5h://`), taking them in turn. With none, connect directly.
+    pub fn proxies(mut self, value: Vec<String>) -> Self {
+        self.proxies = value;
+        self
     }
 
     /// Cache list and manifest responses on disk.
@@ -609,7 +619,9 @@ impl NuClientBuilder {
 
 /// Client for interacting with the NU service.
 pub struct NuClient {
-    client: Client,
+    /// One client per proxy, or a single direct client.
+    clients: Vec<Client>,
+    next: AtomicUsize,
     cache: Option<Cache>,
 }
 
@@ -617,15 +629,42 @@ impl NuClient {
     fn with_options(options: &NuClientBuilder) -> Result<Self> {
         debug!("TLS validation enabled: {}", !options.ignore_tls_validation);
 
-        let client = ClientBuilder::new()
-            .danger_accept_invalid_certs(options.ignore_tls_validation)
-            .referer(false)
-            .build()?;
+        let build = |proxy: Option<&str>| -> Result<Client> {
+            let mut builder = ClientBuilder::new()
+                .danger_accept_invalid_certs(options.ignore_tls_validation)
+                .referer(false);
+            if let Some(url) = proxy {
+                builder = builder.proxy(reqwest::Proxy::all(url)?);
+            }
+
+            Ok(builder.build()?)
+        };
+
+        // Proxy URLs can carry credentials, so they are never logged.
+        debug!("Proxies: {}", options.proxies.len());
+        let clients = if options.proxies.is_empty() {
+            vec![build(None)?]
+        } else {
+            options
+                .proxies
+                .iter()
+                .map(|p| build(Some(p)))
+                .collect::<Result<_>>()?
+        };
 
         Ok(Self {
-            client,
+            clients,
+            next: AtomicUsize::new(0),
             cache: options.cache.clone(),
         })
+    }
+
+    /// The client for the next request. Requests rotate through the proxies, so
+    /// the parts of a download are spread across them.
+    fn client(&self) -> &Client {
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+
+        &self.clients[i]
     }
 
     /// Like [`Self::exec`], but serves from and fills the cache under `key`.
@@ -698,7 +737,7 @@ impl NuClient {
     pub async fn get_region(&self) -> Result<String> {
         // The last path component doesn't matter.
         let url = format!("{BASE_URL}/region/status/KR");
-        let data: RegionStatusData = Self::exec(self.client.get(&url)).await?;
+        let data: RegionStatusData = Self::exec(self.client().get(&url)).await?;
 
         if EU_EEA_ISO_3166_1.contains(&data.region.as_str()) {
             return Ok("EU".to_owned());
@@ -711,7 +750,7 @@ impl NuClient {
     pub async fn validate_region(&self, brand: &str, region: &str) -> Result<()> {
         let platform_url = format!("{}/car/platform/{brand}/{}", base_url(region), region);
 
-        let is_valid = match Self::exec::<Vec<IgnoredAny>>(self.client.get(&platform_url)).await {
+        let is_valid = match Self::exec::<Vec<IgnoredAny>>(self.client().get(&platform_url)).await {
             Ok(platforms) => !platforms.is_empty(),
             // The server sometimes returns a response with no data field or
             // returns HTTP 499. These are both indicative of a bad region.
@@ -733,7 +772,7 @@ impl NuClient {
     /// firmware information with [`Self::get_cars`].
     pub async fn get_guid(&self, region: &str) -> Result<String> {
         let url = format!("{}/guid/{region}", base_url(region));
-        let data: GuidData = Self::exec(self.client.get(&url)).await?;
+        let data: GuidData = Self::exec(self.client().get(&url)).await?;
 
         Ok(data.guid)
     }
@@ -758,7 +797,7 @@ impl NuClient {
         let authorization = Authorization::new();
 
         self.exec_cached(
-            self.client
+            self.client()
                 .post(&url)
                 .header(header::AUTHORIZATION, authorization.to_string())
                 .json(&request_json),
@@ -789,7 +828,7 @@ impl NuClient {
         );
         let data: CarDownloadData = self
             .exec_cached(
-                self.client
+                self.client()
                     .get(&url)
                     .header(header::AUTHORIZATION, authorization.to_string()),
                 &key,
@@ -816,7 +855,7 @@ impl NuClient {
         debug!("Requesting bytes {start}- from: {url}");
 
         let r = self
-            .client
+            .client()
             .get(&url)
             .header(header::USER_AGENT, USER_AGENT)
             .header(header::RANGE, format!("bytes={start}-"))
@@ -827,7 +866,7 @@ impl NuClient {
 
         if status == StatusCode::RANGE_NOT_SATISFIABLE {
             let head_r = self
-                .client
+                .client()
                 .head(&url)
                 .header(header::USER_AGENT, USER_AGENT)
                 .send()
