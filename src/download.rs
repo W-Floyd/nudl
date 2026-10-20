@@ -14,10 +14,11 @@ use cap_std::fs::{Dir, Metadata, OpenOptions};
 use crc32fast::Hasher;
 use flate2::read::DeflateDecoder;
 use rawzip::{CompressionMethod, RECOMMENDED_BUFFER_SIZE, ZipArchive};
+use sha2::{Digest, Sha256};
 use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
     task::{self, JoinSet},
     time,
 };
@@ -94,6 +95,80 @@ struct InitialState {
 enum TaskResult {
     Download((usize, u32, Result<()>)),
     PostProcess((usize, Result<()>)),
+    Move(Result<()>),
+}
+
+/// Move finished files out of the output directory as soon as they are
+/// verified, instead of leaving them for the caller to move afterwards.
+pub struct MoveConfig {
+    /// Destination directory; may be on another filesystem.
+    pub dir: PathBuf,
+    /// If set, a `sha256<TAB>relative path` line is appended per moved file,
+    /// hashed during the copy so the destination need not be read again.
+    pub hash_log: Option<PathBuf>,
+    /// Files moved at once. Kept low so a slow destination isn't thrashed.
+    pub concurrency: usize,
+}
+
+struct Mover {
+    dir: PathBuf,
+    hash_log: Option<PathBuf>,
+    permits: Semaphore,
+}
+
+impl Mover {
+    /// Copy `rel` out of `directory` through `<dest>.part`, so an interruption
+    /// never leaves a short file at the final name, then delete the source.
+    fn copy_out(&self, directory: &Dir, rel: &str) -> Result<()> {
+        let dst = self.dir.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory: {parent:?}"))?;
+        }
+        let part = PathBuf::from(format!("{}.part", dst.display()));
+
+        let mut src = directory
+            .open(rel)
+            .with_context(|| format!("Failed to open file: {rel}"))?
+            .into_std();
+        let mut out = std::fs::File::create(&part)
+            .with_context(|| format!("Failed to create file: {part:?}"))?;
+
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = src.read(&mut buf).with_context(|| format!("Failed to read: {rel}"))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            out.write_all(&buf[..n])
+                .with_context(|| format!("Failed to write: {part:?}"))?;
+        }
+        out.flush()?;
+        drop(out);
+
+        std::fs::rename(&part, &dst).with_context(|| format!("Failed to rename: {part:?}"))?;
+        directory
+            .remove_file(rel)
+            .with_context(|| format!("Failed to delete: {rel}"))?;
+
+        if let Some(log) = &self.hash_log {
+            let hex: String = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+                .with_context(|| format!("Failed to open hash log: {log:?}"))?;
+            writeln!(f, "{hex}\t{rel}")?;
+        }
+
+        Ok(())
+    }
 }
 
 pub enum ProgressMessage {
@@ -127,6 +202,7 @@ pub struct Downloader {
     retries: u8,
     keep_raw: bool,
     present: Option<Arc<Dir>>,
+    move_to: Option<Arc<Mover>>,
     progress_tx: mpsc::Sender<ProgressMessage>,
 }
 
@@ -141,6 +217,7 @@ impl Downloader {
         retries: u8,
         keep_raw: bool,
         present: Option<Dir>,
+        move_to: Option<MoveConfig>,
     ) -> (Self, mpsc::Receiver<ProgressMessage>) {
         let (progress_tx, progress_rx) = mpsc::channel(2 * concurrency);
 
@@ -153,6 +230,13 @@ impl Downloader {
             retries,
             keep_raw,
             present: present.map(Arc::new),
+            move_to: move_to.map(|m| {
+                Arc::new(Mover {
+                    dir: m.dir,
+                    hash_log: m.hash_log,
+                    permits: Semaphore::new(m.concurrency.max(1)),
+                })
+            }),
             progress_tx,
         };
 
@@ -753,6 +837,19 @@ impl Downloader {
         TaskResult::PostProcess((file_index, result))
     }
 
+    async fn move_file(directory: Arc<Dir>, mover: Arc<Mover>, rel: String) -> Result<()> {
+        let permit = mover.permits.acquire().await?;
+        let m = mover.clone();
+        let result = task::spawn_blocking(move || m.copy_out(&directory, &rel)).await?;
+        drop(permit);
+
+        result
+    }
+
+    async fn move_task(directory: Arc<Dir>, mover: Arc<Mover>, rel: String) -> TaskResult {
+        TaskResult::Move(Self::move_file(directory, mover, rel).await)
+    }
+
     pub async fn download(&self) -> Result<()> {
         // Write version info file. This is not cancellable because it's a
         // single write operation.
@@ -878,6 +975,28 @@ impl Downloader {
                     debug!("[PostProcess#{f_i}] Task completed");
                     pp_running -= 1;
                     result?;
+
+                    // The file is final and verified; send it on its way while
+                    // the remaining files keep downloading.
+                    if let Some(mover) = &self.move_to {
+                        tasks.spawn(Self::move_task(
+                            self.directory.clone(),
+                            mover.clone(),
+                            self.firmware.files[f_i].path(),
+                        ));
+                    }
+                }
+                TaskResult::Move(result) => result?,
+            }
+        }
+
+        // Files that were already complete in the output directory (for
+        // example from an earlier interrupted run) never got a task above.
+        if let Some(mover) = &self.move_to {
+            for file in &self.firmware.files {
+                let rel = file.path();
+                if self.directory.metadata(&rel).is_ok() {
+                    Self::move_file(self.directory.clone(), mover.clone(), rel).await?;
                 }
             }
         }

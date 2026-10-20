@@ -34,7 +34,7 @@ use crate::{
         default_cache_dir,
     },
     client::{Cache, CarInfo, NuClient, NuClientBuilder},
-    download::Downloader,
+    download::{Downloader, MoveConfig},
     progress::{Osc94, Osc94Printer, ProgressSuspendingStderr, SpeedTracker, progress_percentage},
     verify::Verifier,
 };
@@ -345,6 +345,11 @@ async fn download_subcommand(cli: &DownloadCli, bars: MultiProgress) -> Result<(
         cli.retries,
         cli.keep_raw,
         present,
+        cli.move_to.clone().map(|dir| MoveConfig {
+            dir,
+            hash_log: cli.hash_log.clone(),
+            concurrency: cli.move_concurrency,
+        }),
     );
     let handle = downloader.download();
     tokio::pin!(handle);

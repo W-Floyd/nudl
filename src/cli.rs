@@ -291,6 +291,25 @@ pub struct DownloadCli {
     #[arg(long, value_name = "DIR")]
     pub present_in: Option<PathBuf>,
 
+    /// Move each file to DIR as soon as it is verified.
+    ///
+    /// The output directory then acts as scratch space (a ramdisk or SSD) and DIR
+    /// is the final destination, which may be on another filesystem. Files are
+    /// copied through `<name>.part` and deleted from the output directory once
+    /// in place. Combine with `--present-in DIR` so a resumed run skips them.
+    #[arg(long, value_name = "DIR")]
+    pub move_to: Option<PathBuf>,
+
+    /// With `--move-to`, append `sha256<TAB>path` for each moved file to FILE.
+    ///
+    /// The hash is computed during the copy, so the destination is not read again.
+    #[arg(long, value_name = "FILE", requires = "move_to")]
+    pub hash_log: Option<PathBuf>,
+
+    /// With `--move-to`, how many files are moved at once.
+    #[arg(long, value_name = "N", default_value_t = 2, requires = "move_to")]
+    pub move_concurrency: usize,
+
     /// Smallest file, in bytes, that `--link-from` will link.
     #[arg(long, value_name = "BYTES", default_value_t = 1_048_576)]
     pub link_min_size: u64,
