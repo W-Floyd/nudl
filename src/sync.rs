@@ -933,7 +933,13 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
     if interrupted {
         shared.stop.store(true, Ordering::Relaxed);
         set.abort_all();
-        bail!("Interrupted. Rerun the same command to resume.");
+        eprintln!("Interrupted. Rerun the same command to resume.");
+        // Leave now. Returning would make the runtime wait for blocking work already
+        // in flight (copies onto a slow array, setup), which can take minutes, and
+        // further Ctrl-C would do nothing. Everything here resumes: copies go through
+        // `.part`, partial downloads stay in the stage, and the lock is released on
+        // exit.
+        std::process::exit(130);
     }
 
     let st = shared.state.lock().unwrap();
