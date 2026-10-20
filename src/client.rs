@@ -674,7 +674,7 @@ impl NuClient {
 
     /// The client for the next request. Requests rotate through the proxies, so
     /// the parts of a download are spread across them.
-    fn client(&self) -> &Client {
+    pub fn client(&self) -> &Client {
         let i = ROTATION.fetch_add(1, Ordering::Relaxed) % self.clients.len();
 
         &self.clients[i]

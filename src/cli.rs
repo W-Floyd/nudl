@@ -443,6 +443,68 @@ pub struct SyncCli {
     #[arg(long, value_name = "BYTES", default_value_t = 1_048_576)]
     pub link_min_size: u64,
 
+    /// Skip the zips linked from update.kia.com notices.
+    ///
+    /// Those are the only source for firmware the NU API doesn't list (the Niro
+    /// Plus taxi's); they go in `<root>/notices/<notice id>/`. Also skipped with
+    /// `--model`, any brand but kia, or any region but KR.
+    #[arg(long)]
+    pub no_notices: bool,
+
+    /// Skip Hyundai Mobis's open-source packages (mobis.com/en/tech/rnd.do).
+    ///
+    /// Source and licence-notice zips per head unit platform; they go in
+    /// `<root>/mobis/`, see `nudl mobis`. Also skipped with `--model`.
+    #[arg(long)]
+    pub no_mobis: bool,
+
+    #[command(flatten)]
+    pub network: NetworkGroup,
+}
+
+/// List the zip downloads linked from update.kia.com notices.
+///
+/// These are firmware the NU API doesn't offer (the Niro Plus taxi's). Prints the
+/// notice URL and the zip URL; `sync` downloads them, as does `--download`.
+#[derive(Debug, Parser)]
+pub struct NoticesCli {
+    /// Download the zips missing from `<DIR>/notices/<notice id>/` instead of listing.
+    #[arg(long, value_name = "DIR")]
+    pub download: Option<PathBuf>,
+
+    /// Parallel ranges per large zip, spread over the proxies.
+    ///
+    /// The maximum concurrency allowed is 16.
+    #[arg(short, long, default_value = "8")]
+    pub concurrency: Concurrency,
+
+    /// Maximum retries during download.
+    #[arg(long, default_value = "3")]
+    pub retries: u8,
+
+    #[command(flatten)]
+    pub network: NetworkGroup,
+}
+
+/// List Hyundai Mobis's open-source packages, or download them.
+///
+/// One row per model and platform: the model, the platform, and the source and
+/// licence-notice zip names. Many models share a platform, so `--download` fetches
+/// each distinct file once into `<DIR>/mobis/<file id>/`, with an `index.tsv`.
+#[derive(Debug, Parser)]
+pub struct MobisCli {
+    /// Download the files missing from `<DIR>/mobis/` instead of listing.
+    #[arg(long, value_name = "DIR")]
+    pub download: Option<PathBuf>,
+
+    /// Files downloading at once. The server can't split a file into ranges.
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    pub workers: usize,
+
+    /// Maximum retries per file.
+    #[arg(long, default_value = "3")]
+    pub retries: u8,
+
     #[command(flatten)]
     pub network: NetworkGroup,
 }
@@ -502,6 +564,8 @@ pub enum Command {
     Download(DownloadCli),
     Verify(VerifyCli),
     Sync(SyncCli),
+    Notices(NoticesCli),
+    Mobis(MobisCli),
     Relink(RelinkCli),
     Index(IndexCli),
 }

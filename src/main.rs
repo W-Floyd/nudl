@@ -10,7 +10,9 @@ mod download;
 #[cfg(unix)]
 mod index;
 mod link;
+mod mobis;
 mod model;
+mod notices;
 mod progress;
 #[cfg(unix)]
 mod relink;
@@ -36,8 +38,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     cli::{
-        Brand, Cli, Command, DownloadCli, ListCli, NetworkGroup, OutputFormat, VerifyCli,
-        default_cache_dir,
+        Brand, Cli, Command, DownloadCli, ListCli, MobisCli, NetworkGroup, NoticesCli,
+        OutputFormat, VerifyCli, default_cache_dir,
     },
     client::{Cache, CarInfo, NuClient, NuClientBuilder},
     download::{Downloader, MoveConfig},
@@ -460,6 +462,40 @@ async fn verify_subcommand(cli: &VerifyCli, bars: MultiProgress) -> Result<()> {
     Ok(())
 }
 
+async fn mobis_subcommand(cli: &MobisCli) -> Result<()> {
+    let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
+
+    if let Some(root) = &cli.download {
+        mobis::sync(&client, root, false, cli.workers, cli.retries).await?;
+
+        return Ok(());
+    }
+
+    for p in mobis::list(&client).await? {
+        println!("{}\t{}\t{}\t{}", p.model, p.platform, p.files[0].name, p.files[1].name);
+    }
+
+    Ok(())
+}
+
+async fn notices_subcommand(cli: &NoticesCli) -> Result<()> {
+    let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
+
+    if let Some(root) = &cli.download {
+        notices::sync(&client, root, false, cli.concurrency.0.into(), cli.retries).await?;
+
+        return Ok(());
+    }
+
+    for n in notices::list(&client).await? {
+        for z in &n.zips {
+            println!("{}\t{}", n.url(), z.url);
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -483,6 +519,8 @@ async fn main() -> Result<()> {
         Command::Download(c) => download_subcommand(c, bars).await,
         Command::Verify(c) => verify_subcommand(c, bars).await,
         Command::Sync(c) => sync::run(c).await,
+        Command::Notices(c) => notices_subcommand(c).await,
+        Command::Mobis(c) => mobis_subcommand(c).await,
         #[cfg(unix)]
         Command::Relink(c) => relink::run(c),
         #[cfg(not(unix))]

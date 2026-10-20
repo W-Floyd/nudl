@@ -32,7 +32,7 @@ use crate::{
     cli::{Brand, SyncCli},
     client::{self, CarInfo, FileInfo, FirmwareInfo, NuClient},
     download::{Downloader, ProgressMessage},
-    link, prepare_client,
+    link, mobis, notices, prepare_client,
     version::VersionInfo,
 };
 
@@ -917,6 +917,54 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
     // Planning only reads, so it can run beside a live sync; a real run takes the lock.
     let _lock = if cli.plan { None } else { Some(lock(&root)?) };
 
+    // Notice zips are a separate source, so their failure doesn't stop the rest.
+    let notices_err = if wants_notices(cli) {
+        let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
+        let run = notices::sync(&client, &root, cli.plan, cli.concurrency.0.into(), cli.retries);
+        let result = tokio::select! {
+            r = run => r,
+            _ = ctrl_c() => {
+                eprintln!("Interrupted. Rerun the same command to resume.");
+                std::process::exit(130);
+            }
+        };
+
+        match result {
+            Ok(_) => None,
+            Err(e) if cli.plan => return Err(e),
+            Err(e) => {
+                warn!("Notice downloads: {e:#}");
+                Some(e)
+            }
+        }
+    } else {
+        None
+    };
+
+    let mobis_err = if !cli.no_mobis && cli.model.is_empty() {
+        let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
+        let run = mobis::sync(&client, &root, cli.plan, cli.workers, cli.retries);
+        let result = tokio::select! {
+            r = run => r,
+            _ = ctrl_c() => {
+                eprintln!("Interrupted. Rerun the same command to resume.");
+                std::process::exit(130);
+            }
+        };
+
+        match result {
+            Ok(_) => None,
+            Err(e) if cli.plan => return Err(e),
+            Err(e) => {
+                warn!("Mobis downloads: {e:#}");
+                Some(e)
+            }
+        }
+    } else {
+        None
+    };
+    let notices_err = notices_err.or(mobis_err);
+
     let plan = make_plan(cli, &root).await?;
     let free = report(&plan, &root);
     if cli.plan {
@@ -1115,6 +1163,17 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
         }
         bail!("{} downloads failed; rerun to retry", st.failed.len());
     }
+    if let Some(e) = notices_err {
+        return Err(e);
+    }
 
     Ok(())
+}
+
+/// Notices only hold Kia's KR firmware, and have no model ID to filter by.
+fn wants_notices(cli: &SyncCli) -> bool {
+    !cli.no_notices
+        && cli.model.is_empty()
+        && (cli.brand.is_empty() || cli.brand.iter().any(|b| matches!(b, Brand::Kia)))
+        && (cli.region.is_empty() || cli.region.iter().any(|r| r.eq_ignore_ascii_case("KR")))
 }
