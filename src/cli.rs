@@ -437,13 +437,45 @@ pub struct SyncCli {
     #[arg(long, value_name = "N", default_value_t = 16)]
     pub plan_jobs: usize,
 
-    /// Smallest file, in bytes, that is shared between versions. Smaller files
-    /// are downloaded per version, in one batch.
+    /// Files smaller than this, in bytes, are fetched in one batch per version
+    /// instead of one job each. They are still shared between versions: hardlinked
+    /// from an existing copy, or from the first version that fetches them.
     #[arg(long, value_name = "BYTES", default_value_t = 1_048_576)]
     pub link_min_size: u64,
 
     #[command(flatten)]
     pub network: NetworkGroup,
+}
+
+/// Replace duplicate files in an archive with hardlinks.
+///
+/// Files with the same CRC32 and size (from each version's `.ver`) are the same
+/// file. Those held in separate inodes are replaced by hardlinks to one copy, which
+/// frees the space and the inodes. Only finished versions are touched. Takes the
+/// same lock as `sync`, so it can't run beside one. Dry run unless `--apply`.
+#[derive(Debug, Parser)]
+pub struct RelinkCli {
+    /// Archive directory. Layout: `<brand>/<region>/<model id>/<version>/`.
+    #[arg(long, value_name = "DIR")]
+    pub root: PathBuf,
+
+    /// Do it. Without this, only report what would change.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Compare the contents of each file with the copy it will link to before
+    /// replacing it, so a CRC32 collision can't merge two different files. Reads both
+    /// copies, which is slow on a large archive.
+    #[arg(long)]
+    pub verify: bool,
+
+    /// Ignore files smaller than this, in bytes.
+    #[arg(long, value_name = "BYTES", default_value_t = 0)]
+    pub min_size: u64,
+
+    /// Threads running the filesystem work. Each operation can wait on a slow disk.
+    #[arg(long, value_name = "N", default_value_t = 16)]
+    pub threads: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -452,6 +484,7 @@ pub enum Command {
     Download(DownloadCli),
     Verify(VerifyCli),
     Sync(SyncCli),
+    Relink(RelinkCli),
 }
 
 fn cli_additional_help() -> String {

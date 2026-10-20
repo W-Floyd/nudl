@@ -81,8 +81,9 @@ struct Job {
     kind: Kind,
     /// Target whose directory receives the files.
     owner: usize,
-    /// (target, file index) pairs to hardlink once the owner's file lands.
-    waiters: Vec<(usize, usize)>,
+    /// (target, file index, owner's file index): hardlinks to make once the owner's
+    /// file lands.
+    waiters: Vec<(usize, usize, usize)>,
     /// Scratch space to reserve, in bytes.
     need: u64,
     /// Name of the staging directory, stable across runs so a resume finds it.
@@ -134,8 +135,8 @@ async fn make_plan(cli: &SyncCli, root: &Path) -> Result<Plan> {
 
     let index = {
         let root = root.to_path_buf();
-        let min = cli.link_min_size;
-        tokio::task::spawn_blocking(move || link::index(&[root], min, Some(VERSION_DEPTH)))
+        // Every size: small files are shared too (see `--link-min-size`).
+        tokio::task::spawn_blocking(move || link::index(&[root], 0, Some(VERSION_DEPTH)))
             .await??
     };
     debug!("Archive index: {} files", index.len());
@@ -232,13 +233,14 @@ async fn make_plan(cli: &SyncCli, root: &Path) -> Result<Plan> {
     }
 
     let mut jobs: Vec<Job> = vec![];
-    let mut by_key: HashMap<Key, usize> = HashMap::new();
+    // key -> (job that fetches it, index of the file within its owner target)
+    let mut by_key: HashMap<Key, (usize, usize)> = HashMap::new();
     let mut links = vec![];
     let (mut listed, mut to_download, mut to_link) = (0u64, 0u64, 0u64);
 
     for ti in 0..targets.len() {
         let t = &targets[ti];
-        let mut bulk: Vec<usize> = vec![];
+        let mut small: Vec<(usize, Key)> = vec![];
         let mut remaining = 0;
 
         for (fi, f) in t.fw.files.iter().enumerate() {
@@ -248,21 +250,19 @@ async fn make_plan(cli: &SyncCli, root: &Path) -> Result<Plan> {
             }
             remaining += 1;
 
-            if f.size < cli.link_min_size {
-                bulk.push(fi);
-                to_download += f.size;
-                continue;
-            }
-
             let key = (f.crc32, f.size);
-            if let Some(src) = index.get(&key) {
+            // Small files are fetched in one batch per version, but resolved below
+            // like the rest so they are shared as well.
+            if f.size < cli.link_min_size {
+                small.push((fi, key));
+            } else if let Some(src) = index.get(&key) {
                 links.push((ti, fi, src.clone()));
                 to_link += f.size;
-            } else if let Some(&j) = by_key.get(&key) {
-                jobs[j].waiters.push((ti, fi));
+            } else if let Some(&(j, of)) = by_key.get(&key) {
+                jobs[j].waiters.push((ti, fi, of));
                 to_link += f.size;
             } else {
-                by_key.insert(key, jobs.len());
+                by_key.insert(key, (jobs.len(), fi));
                 jobs.push(Job {
                     kind: Kind::Big(fi),
                     owner: ti,
@@ -274,12 +274,35 @@ async fn make_plan(cli: &SyncCli, root: &Path) -> Result<Plan> {
             }
         }
 
+        // This target's batch of small files will be the next job pushed.
+        let jid = jobs.len();
+        let mut bulk: Vec<usize> = vec![];
+        let mut own_waiters: Vec<(usize, usize, usize)> = vec![];
+        for (fi, key) in small {
+            let size = t.fw.files[fi].size;
+            if let Some(src) = index.get(&key) {
+                links.push((ti, fi, src.clone()));
+                to_link += size;
+            } else if let Some(&(j, of)) = by_key.get(&key) {
+                if j == jid {
+                    own_waiters.push((ti, fi, of));
+                } else {
+                    jobs[j].waiters.push((ti, fi, of));
+                }
+                to_link += size;
+            } else {
+                by_key.insert(key, (jid, fi));
+                bulk.push(fi);
+                to_download += size;
+            }
+        }
+
         if !bulk.is_empty() {
             let need = bulk.iter().map(|&i| file_need(&t.fw.files[i])).sum();
             jobs.push(Job {
                 kind: Kind::Bulk(bulk),
                 owner: ti,
-                waiters: vec![],
+                waiters: own_waiters,
                 need,
                 name: format!("b-{}", sanitize(&t.label)),
             });
@@ -552,30 +575,21 @@ fn finish_job(shared: &Shared, jid: usize, result: Result<()>) {
 
         let owner = st.jobs[jid].owner;
         let waiters = std::mem::take(&mut st.jobs[jid].waiters);
-        let big = match &st.jobs[jid].kind {
-            Kind::Big(fi) => Some(*fi),
-            Kind::Bulk(files) => {
-                let n = files.len();
-                completions.extend(st.landed(owner, n));
-                None
-            }
+        let landed = match &st.jobs[jid].kind {
+            Kind::Big(_) => 1,
+            Kind::Bulk(files) => files.len(),
         };
+        completions.extend(st.landed(owner, landed));
 
-        match big {
-            None => vec![],
-            Some(fi) => {
-                let src = st.targets[owner].dest.join(st.targets[owner].fw.files[fi].path());
-                completions.extend(st.landed(owner, 1));
-
-                waiters
-                    .into_iter()
-                    .map(|(wt, wf)| {
-                        let dst = st.targets[wt].dest.join(st.targets[wt].fw.files[wf].path());
-                        (wt, src.clone(), dst)
-                    })
-                    .collect()
-            }
-        }
+        // Each waiter links from its own file in the owner's directory.
+        waiters
+            .into_iter()
+            .map(|(wt, wf, of)| {
+                let src = st.targets[owner].dest.join(st.targets[owner].fw.files[of].path());
+                let dst = st.targets[wt].dest.join(st.targets[wt].fw.files[wf].path());
+                (wt, src, dst)
+            })
+            .collect()
     };
 
     let results: Vec<_> = links
@@ -846,7 +860,7 @@ async fn worker(
 /// Hold `<root>/.sync.lock` for the life of the returned file, so two syncs of the
 /// same archive can't run at once.
 #[cfg(unix)]
-fn lock(root: &Path) -> Result<fs::File> {
+pub(crate) fn lock(root: &Path) -> Result<fs::File> {
     use std::os::fd::AsRawFd;
 
     let path = root.join(".sync.lock");
@@ -864,7 +878,7 @@ fn lock(root: &Path) -> Result<fs::File> {
 }
 
 #[cfg(not(unix))]
-fn lock(root: &Path) -> Result<fs::File> {
+pub(crate) fn lock(root: &Path) -> Result<fs::File> {
     let path = root.join(".sync.lock");
 
     fs::File::create(&path).with_context(|| format!("Failed to create {path:?}"))

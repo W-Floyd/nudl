@@ -10,6 +10,8 @@ mod download;
 mod link;
 mod model;
 mod progress;
+#[cfg(unix)]
+mod relink;
 mod sync;
 mod verify;
 mod version;
@@ -479,5 +481,9 @@ async fn main() -> Result<()> {
         Command::Download(c) => download_subcommand(c, bars).await,
         Command::Verify(c) => verify_subcommand(c, bars).await,
         Command::Sync(c) => sync::run(c).await,
+        #[cfg(unix)]
+        Command::Relink(c) => relink::run(c),
+        #[cfg(not(unix))]
+        Command::Relink(_) => bail!("relink needs hardlinks and inode numbers, so Unix only"),
     }
 }

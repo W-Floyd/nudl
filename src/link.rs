@@ -38,6 +38,16 @@ fn collect_ver_files(
     Ok(())
 }
 
+/// Find the `.ver` files under `roots`; see [`collect_ver_files`] for the walk.
+pub fn find_ver_files(roots: &[PathBuf], max_depth: Option<usize>) -> io::Result<Vec<PathBuf>> {
+    let mut out = vec![];
+    for root in roots {
+        collect_ver_files(root, 0, max_depth, &mut out)?;
+    }
+
+    Ok(out)
+}
+
 /// Map (CRC32, size) to an existing file, for every file listed in a `.ver`
 /// under `roots`. A file only exists at its final path once it is downloaded and
 /// verified, so presence plus a matching size is enough to trust the `.ver`.
@@ -68,13 +78,16 @@ pub fn index(
         };
 
         for entry in info.entries {
-            if entry.size < min_size {
+            // One verified copy per key is all that is needed, and each check is a
+            // stat on what may be a slow filesystem.
+            let key = (entry.crc32, entry.size);
+            if entry.size < min_size || map.contains_key(&key) {
                 continue;
             }
 
             let path = dir.join(&*entry.path());
             if fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == entry.size) {
-                map.entry((entry.crc32, entry.size)).or_insert(path);
+                map.insert(key, path);
             }
         }
     }
