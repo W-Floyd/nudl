@@ -125,8 +125,10 @@ async fn make_plan(cli: &SyncCli, root: &Path) -> Result<Plan> {
     };
     debug!("Archive index: {} files", index.len());
 
-    // Cars with at least one version not yet complete.
+    // Cars with at least one version not yet complete. Cars that are entirely
+    // complete never need a manifest, so count their versions here.
     let mut pending: Vec<(Brand, String, CarInfo)> = vec![];
+    let mut settled_versions = 0;
     for &brand in &brands {
         for region in &regions {
             eprint!("\rlisting {} {region}   ", brand_dir(brand));
@@ -148,6 +150,8 @@ async fn make_plan(cli: &SyncCli, root: &Path) -> Result<Plan> {
                     .any(|v| !dest.join(v).join(".complete").exists())
                 {
                     pending.push((brand, region.clone(), car));
+                } else {
+                    settled_versions += car.versions.len();
                 }
             }
         }
@@ -184,7 +188,7 @@ async fn make_plan(cli: &SyncCli, root: &Path) -> Result<Plan> {
 
     // Targets, then what each of their files needs.
     let mut targets: Vec<Target> = vec![];
-    let mut complete_targets = 0;
+    let mut complete_targets = settled_versions;
     for ((brand, region, car), fw) in pending.iter().zip(&firmware) {
         let fw = fw.clone().expect("fetched above");
         let car = Arc::new(car.clone());
