@@ -396,6 +396,11 @@ pub struct SyncCli {
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub workers: usize,
 
+    /// Downloaded jobs moved from scratch into the archive at once. Downloads don't
+    /// wait for these, so a slow archive only makes the scratch tiers fill.
+    #[arg(long, value_name = "N", default_value_t = 3)]
+    pub move_workers: usize,
+
     /// Connections per file.
     ///
     /// The maximum concurrency allowed is 16.

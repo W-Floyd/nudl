@@ -20,14 +20,18 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use cap_std::{ambient_authority, fs::Dir};
-use tokio::{signal::ctrl_c, sync::Semaphore, task::JoinSet};
+use tokio::{
+    signal::ctrl_c,
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+};
 use tracing::{debug, warn};
 
 use crate::{
     build_client,
     cli::{Brand, SyncCli},
     client::{self, CarInfo, FileInfo, FirmwareInfo, NuClient},
-    download::{Downloader, MoveConfig, ProgressMessage},
+    download::{Downloader, ProgressMessage},
     link, prepare_client,
     version::VersionInfo,
 };
@@ -432,6 +436,10 @@ impl Tiers {
         None
     }
 
+    fn reserved_total(&self) -> u64 {
+        self.reserved.lock().unwrap().iter().sum()
+    }
+
     fn release(&self, tier: usize, need: u64) {
         self.reserved.lock().unwrap()[tier] -= need;
     }
@@ -457,6 +465,8 @@ struct Shared {
     /// Background setup (manifests, links to files already archived): done / total.
     prep_done: AtomicU64,
     prep_total: u64,
+    /// Jobs downloaded into a tier and not yet moved into the archive.
+    moving: AtomicUsize,
 }
 
 fn hard_link_into(src: &Path, dst: &Path) -> Result<()> {
@@ -641,7 +651,57 @@ fn prepare(shared: &Shared, links: Vec<(usize, PathBuf, PathBuf)>, threads: usiz
     });
 }
 
-async fn run_job(shared: &Shared, client: &Arc<NuClient>, jid: usize) -> Result<()> {
+/// A job whose files are downloaded and sitting in a scratch tier, waiting to be
+/// moved into the archive.
+struct MoveTask {
+    jid: usize,
+    stage: PathBuf,
+    dest: PathBuf,
+    tier: usize,
+    need: u64,
+}
+
+/// Move everything under `stage` into `dest`, each file through `<name>.part` so an
+/// interruption never leaves a short file at the final name.
+fn move_tree(stage: &Path, dest: &Path) -> Result<()> {
+    for entry in fs::read_dir(stage)? {
+        let entry = entry?;
+        let (path, target) = (entry.path(), dest.join(entry.file_name()));
+
+        if entry.file_type()?.is_dir() {
+            fs::create_dir_all(&target)?;
+            move_tree(&path, &target)?;
+            let _ = fs::remove_dir(&path);
+        } else {
+            move_file(&path, &target)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn move_file(src: &Path, dst: &Path) -> Result<()> {
+    match fs::rename(src, dst) {
+        Ok(()) => return Ok(()),
+        // A different filesystem: copy.
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
+        Err(e) => return Err(e).with_context(|| format!("Failed to move {src:?}")),
+    }
+
+    let part = PathBuf::from(format!("{}.part", dst.display()));
+    fs::copy(src, &part).with_context(|| format!("Failed to copy {src:?} to {part:?}"))?;
+    fs::rename(&part, dst).with_context(|| format!("Failed to rename {part:?}"))?;
+    fs::remove_file(src).with_context(|| format!("Failed to delete {src:?}"))
+}
+
+/// Downloads a job into a scratch tier (or straight into the archive when no tier
+/// has room). A staged job returns the move still to do; the worker does not wait for
+/// it, so a slow archive filesystem never stalls the downloads.
+async fn run_job(
+    shared: &Shared,
+    client: &Arc<NuClient>,
+    jid: usize,
+) -> Result<Option<MoveTask>> {
     let (car, fw, dest, name, need) = {
         let st = shared.state.lock().unwrap();
         let job = &st.jobs[jid];
@@ -662,16 +722,9 @@ async fn run_job(shared: &Shared, client: &Arc<NuClient>, jid: usize) -> Result<
 
     // The first tier with room; none: straight into the archive.
     let tier = shared.tiers.claim(need);
-    let (out, move_to) = match tier {
-        Some(i) => (
-            shared.tiers.tiers[i].path.join(&name),
-            Some(MoveConfig {
-                dir: dest.clone(),
-                hash_log: None,
-                concurrency: 2,
-            }),
-        ),
-        None => (dest.clone(), None),
+    let out = match tier {
+        Some(i) => shared.tiers.tiers[i].path.join(&name),
+        None => dest.clone(),
     };
 
     let result = async {
@@ -687,7 +740,7 @@ async fn run_job(shared: &Shared, client: &Arc<NuClient>, jid: usize) -> Result<
             shared.retries,
             false,
             None,
-            move_to,
+            None,
         );
         let downloader = downloader.without_version_file();
         let handle = downloader.download();
@@ -706,19 +759,60 @@ async fn run_job(shared: &Shared, client: &Arc<NuClient>, jid: usize) -> Result<
     }
     .await;
 
-    if let Some(i) = tier {
-        shared.tiers.release(i, need);
-        // A failed stage is kept on disk-backed tiers so the retry resumes; RAM is
-        // always freed.
-        if result.is_ok() || shared.tiers.tiers[i].ram {
-            let _ = fs::remove_dir_all(&out);
+    match (result, tier) {
+        (Ok(()), Some(tier)) => Ok(Some(MoveTask {
+            jid,
+            stage: out,
+            dest,
+            tier,
+            need,
+        })),
+        (Ok(()), None) => Ok(None),
+        (Err(e), tier) => {
+            if let Some(i) = tier {
+                shared.tiers.release(i, need);
+                // A failed stage is kept on disk-backed tiers so the retry resumes;
+                // RAM is always freed.
+                if shared.tiers.tiers[i].ram {
+                    let _ = fs::remove_dir_all(&out);
+                }
+            }
+            Err(e)
         }
     }
-
-    result
 }
 
-async fn worker(shared: Arc<Shared>, client: Arc<NuClient>) {
+type MoveRx = Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<MoveTask>>>;
+
+/// Moves staged jobs into the archive, a few at a time, and finishes them.
+async fn mover(shared: Arc<Shared>, rx: MoveRx) {
+    loop {
+        let task = rx.lock().await.recv().await;
+        let Some(task) = task else {
+            return;
+        };
+
+        let s = shared.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let result = move_tree(&task.stage, &task.dest)
+                .with_context(|| format!("Failed to move {:?} into the archive", task.stage));
+            s.tiers.release(task.tier, task.need);
+            // A failed move keeps a disk-backed stage for the retry; RAM is freed.
+            if result.is_ok() || s.tiers.tiers[task.tier].ram {
+                let _ = fs::remove_dir_all(&task.stage);
+            }
+            s.moving.fetch_sub(1, Ordering::Relaxed);
+            finish_job(&s, task.jid, result);
+        })
+        .await;
+    }
+}
+
+async fn worker(
+    shared: Arc<Shared>,
+    client: Arc<NuClient>,
+    moves: mpsc::UnboundedSender<MoveTask>,
+) {
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             return;
@@ -732,11 +826,20 @@ async fn worker(shared: Arc<Shared>, client: Arc<NuClient>) {
             jid
         };
 
-        let result = run_job(&shared, &client, jid).await;
-        // Links and markers touch the archive filesystem, so keep them off the async
-        // threads.
-        let s = shared.clone();
-        let _ = tokio::task::spawn_blocking(move || finish_job(&s, jid, result)).await;
+        match run_job(&shared, &client, jid).await {
+            // Downloaded into a tier: hand it to the movers and take the next job.
+            Ok(Some(task)) => {
+                shared.moving.fetch_add(1, Ordering::Relaxed);
+                let _ = moves.send(task);
+            }
+            // Links and markers touch the archive filesystem, so keep them off the
+            // async threads.
+            other => {
+                let s = shared.clone();
+                let result = other.map(|_| ());
+                let _ = tokio::task::spawn_blocking(move || finish_job(&s, jid, result)).await;
+            }
+        }
     }
 }
 
@@ -865,6 +968,7 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
         retries: cli.retries,
         prep_done: AtomicU64::new(0),
         prep_total,
+        moving: AtomicUsize::new(0),
     });
 
     // Setup runs beside the workers, so a slow archive filesystem can't hold up
@@ -878,6 +982,14 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
         })
     };
 
+    // Finished downloads wait in their scratch tier for a mover; workers don't.
+    let (move_tx, move_rx) = mpsc::unbounded_channel();
+    let move_rx: MoveRx = Arc::new(tokio::sync::Mutex::new(move_rx));
+    let mut movers = JoinSet::new();
+    for _ in 0..cli.move_workers.max(1) {
+        movers.spawn(mover(shared.clone(), move_rx.clone()));
+    }
+
     // One client per worker, each through its own proxy when there are proxies.
     let mut set = JoinSet::new();
     for i in 0..cli.workers.max(1) {
@@ -889,8 +1001,10 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
             .into_iter()
             .collect();
         let client = Arc::new(build_client(&cli.network, proxies)?);
-        set.spawn(worker(shared.clone(), client));
+        set.spawn(worker(shared.clone(), client, move_tx.clone()));
     }
+    // The movers stop once the workers (the other senders) are done and it is empty.
+    drop(move_tx);
 
     let status = {
         let shared = shared.clone();
@@ -910,10 +1024,13 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
                     String::new()
                 };
                 eprintln!(
-                    "sync: {jobs_done}/{total_jobs} jobs, {active} active, {targets_done} \
-                     versions complete, {} GB downloaded ({:.0} MB/s){prep}",
+                    "sync: {jobs_done}/{total_jobs} jobs, {active} active ({} moving), \
+                     {targets_done} versions complete, {} GB downloaded ({:.0} MB/s), \
+                     {} GB reserved in scratch{prep}",
+                    shared.moving.load(Ordering::Relaxed),
                     gb(bytes),
                     bytes as f64 / secs / 1e6,
+                    gb(shared.tiers.reserved_total()),
                 );
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
@@ -925,7 +1042,9 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
         _ = ctrl_c() => true,
         _ = async {
             while set.join_next().await.is_some() {}
-            // Setup may outlast the downloads (a slow archive filesystem).
+            // Then the moves still queued, and setup, which may outlast the downloads
+            // (a slow archive filesystem).
+            while movers.join_next().await.is_some() {}
             let _ = (&mut prep).await;
         } => false,
     };
