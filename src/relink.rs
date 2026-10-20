@@ -229,6 +229,11 @@ pub fn run(cli: &RelinkCli) -> Result<()> {
         if g(&stats.errors) > 0 {
             bail!("{} files could not be relinked", g(&stats.errors));
         }
+        // Paths now point at other inodes, so an existing index is out of date.
+        if g(&stats.relinked) > 0 && crate::index::path(&root).exists() {
+            eprintln!("relink: refreshing the archive index");
+            crate::index::build(&root, cli.threads)?.save(&root)?;
+        }
     } else {
         eprintln!("relink: dry run; pass --apply to do it");
     }

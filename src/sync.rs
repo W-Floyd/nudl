@@ -1075,6 +1075,33 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
         std::process::exit(130);
     }
 
+    // Record the versions this run finished in the archive index. The files were just
+    // written or linked, so looking at them again costs little.
+    #[cfg(unix)]
+    {
+        let finished: Vec<crate::index::Listing> = {
+            let st = shared.state.lock().unwrap();
+            st.targets
+                .iter()
+                .filter(|t| t.remaining == 0)
+                .map(|t| crate::index::Listing {
+                    id: crate::index::package_id(&root, &t.dest),
+                    dir: t.dest.clone(),
+                    complete: true,
+                    files: t.fw.files.iter().map(|f| (f.path(), f.size)).collect(),
+                })
+                .collect()
+        };
+        eprintln!("sync: recording {} finished versions in the archive index", finished.len());
+        let threads = cli.setup_threads;
+        let root = root.clone();
+        match tokio::task::spawn_blocking(move || crate::index::record_finished(&root, finished, threads)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("sync: archive index not updated: {e:#}"),
+            Err(e) => eprintln!("sync: archive index not updated: {e}"),
+        }
+    }
+
     let st = shared.state.lock().unwrap();
     eprintln!(
         "sync: done. {} versions completed, {} GB downloaded, {} failures",

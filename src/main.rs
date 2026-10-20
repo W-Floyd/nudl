@@ -7,6 +7,8 @@ mod client;
 mod constants;
 mod crypto;
 mod download;
+#[cfg(unix)]
+mod index;
 mod link;
 mod model;
 mod progress;
@@ -485,5 +487,9 @@ async fn main() -> Result<()> {
         Command::Relink(c) => relink::run(c),
         #[cfg(not(unix))]
         Command::Relink(_) => bail!("relink needs hardlinks and inode numbers, so Unix only"),
+        #[cfg(unix)]
+        Command::Index(c) => index::run(c),
+        #[cfg(not(unix))]
+        Command::Index(_) => bail!("the index records inode numbers, so Unix only"),
     }
 }

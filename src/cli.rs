@@ -478,6 +478,24 @@ pub struct RelinkCli {
     pub threads: usize,
 }
 
+/// Write the archive index: which files are the same inode.
+///
+/// `<root>/.nudl-index.gz` lets tools that relate firmware packages to one another
+/// (which share storage, what deleting one would free) skip stat-ing the archive.
+/// `sync` keeps it current for the versions it finishes and `relink` refreshes it, so
+/// this is for making it the first time or rebuilding it after the archive was changed
+/// by something else. It stats every file once.
+#[derive(Debug, Parser)]
+pub struct IndexCli {
+    /// Archive directory. Layout: `<brand>/<region>/<model id>/<version>/`.
+    #[arg(long, value_name = "DIR")]
+    pub root: PathBuf,
+
+    /// Threads running the stats. Each can wait on a slow disk.
+    #[arg(long, value_name = "N", default_value_t = 32)]
+    pub threads: usize,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     List(ListCli),
@@ -485,6 +503,7 @@ pub enum Command {
     Verify(VerifyCli),
     Sync(SyncCli),
     Relink(RelinkCli),
+    Index(IndexCli),
 }
 
 fn cli_additional_help() -> String {
