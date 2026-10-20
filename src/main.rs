@@ -292,15 +292,22 @@ async fn download_subcommand(cli: &DownloadCli, bars: MultiProgress) -> Result<(
     let directory = Dir::open_ambient_dir(&cli.output, authority)
         .with_context(|| format!("Failed to open directory: {:?}", cli.output))?;
 
-    if cli.manifest_only {
-        return Downloader::write_version_file(&directory, car, &firmware);
-    }
-
     if !cli.link_from.is_empty() {
         let index = link::index(&cli.link_from, cli.link_min_size)?;
         let linked = link::link_files(&index, &cli.output, &firmware, cli.link_min_size)?;
         debug!("Linked {linked} existing files");
     }
+
+    if cli.manifest_only {
+        return Downloader::write_version_file(&directory, car, &firmware);
+    }
+
+    let present = cli
+        .present_in
+        .as_ref()
+        .map(|p| Dir::open_ambient_dir(p, authority))
+        .transpose()
+        .with_context(|| format!("Failed to open directory: {:?}", cli.present_in))?;
 
     // The progress will be misreported if files are modified by external
     // processes. Solving this requires sending HEAD requests for each split and
@@ -327,6 +334,7 @@ async fn download_subcommand(cli: &DownloadCli, bars: MultiProgress) -> Result<(
         cli.concurrency.0.into(),
         cli.retries,
         cli.keep_raw,
+        present,
     );
     let handle = downloader.download();
     tokio::pin!(handle);

@@ -245,6 +245,14 @@ pub struct DownloadCli {
     #[arg(long, value_name = "DIR")]
     pub link_from: Vec<PathBuf>,
 
+    /// Skip files that already exist in DIR with the expected size.
+    ///
+    /// For staging: download into a fast scratch output directory while the
+    /// finished files live in DIR (possibly on another filesystem). Skipped
+    /// files are neither downloaded nor written to the output directory.
+    #[arg(long, value_name = "DIR")]
+    pub present_in: Option<PathBuf>,
+
     /// Smallest file, in bytes, that `--link-from` will link.
     #[arg(long, value_name = "BYTES", default_value_t = 1_048_576)]
     pub link_min_size: u64,

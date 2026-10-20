@@ -126,10 +126,12 @@ pub struct Downloader {
     concurrency: usize,
     retries: u8,
     keep_raw: bool,
+    present: Option<Arc<Dir>>,
     progress_tx: mpsc::Sender<ProgressMessage>,
 }
 
 impl Downloader {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         directory: Dir,
         client: NuClient,
@@ -138,6 +140,7 @@ impl Downloader {
         concurrency: usize,
         retries: u8,
         keep_raw: bool,
+        present: Option<Dir>,
     ) -> (Self, mpsc::Receiver<ProgressMessage>) {
         let (progress_tx, progress_rx) = mpsc::channel(2 * concurrency);
 
@@ -149,6 +152,7 @@ impl Downloader {
             concurrency,
             retries,
             keep_raw,
+            present: present.map(Arc::new),
             progress_tx,
         };
 
@@ -167,6 +171,7 @@ impl Downloader {
 
     fn compute_initial_state(
         base_directory: &Dir,
+        present: Option<&Dir>,
         firmware: &FirmwareInfo,
         cancel_signal: &AtomicBool,
     ) -> Result<InitialState> {
@@ -180,6 +185,17 @@ impl Downloader {
             check_cancel(cancel_signal)?;
 
             let remain = &mut dl_remain[f_i];
+
+            if let Some(p) = present {
+                if p.metadata(&*file_info.path())
+                    .is_ok_and(|m| m.is_file() && m.len() == file_info.size)
+                {
+                    // Finished elsewhere (--present-in).
+                    dl_bytes += file_info.download_size();
+                    pp_bytes += file_info.size;
+                    continue;
+                }
+            }
 
             let owned_directory: Dir;
             let directory = if let Some(name) = &file_info.directory {
@@ -754,10 +770,16 @@ impl Downloader {
             let cancel_signal = cancel_on_drop.handle();
 
             let base_directory = self.directory.clone();
+            let present = self.present.clone();
             let firmware = self.firmware.clone();
 
             task::spawn_blocking(move || {
-                Self::compute_initial_state(&base_directory, &firmware, &cancel_signal)
+                Self::compute_initial_state(
+                    &base_directory,
+                    present.as_deref(),
+                    &firmware,
+                    &cancel_signal,
+                )
             })
             .await??
         };
