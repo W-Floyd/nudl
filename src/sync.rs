@@ -53,6 +53,17 @@ struct Target {
     dest: PathBuf,
     /// Files not yet in place.
     remaining: usize,
+    /// Whether `<id>.ver` is on disk.
+    ver_written: bool,
+}
+
+/// A version whose files are all in place; `.complete` still has to be written.
+struct Completion {
+    label: String,
+    car: Arc<CarInfo>,
+    fw: Arc<FirmwareInfo>,
+    dest: PathBuf,
+    ver_written: bool,
 }
 
 enum Kind {
@@ -208,6 +219,7 @@ async fn make_plan(cli: &SyncCli, root: &Path) -> Result<Plan> {
                 fw: fw.clone(),
                 dest,
                 remaining: 0,
+                ver_written: false,
             });
         }
     }
@@ -439,6 +451,9 @@ struct Shared {
     stop: AtomicBool,
     concurrency: usize,
     retries: u8,
+    /// Background setup (manifests, links to files already archived): done / total.
+    prep_done: AtomicU64,
+    prep_total: u64,
 }
 
 fn hard_link_into(src: &Path, dst: &Path) -> Result<()> {
@@ -452,56 +467,162 @@ fn hard_link_into(src: &Path, dst: &Path) -> Result<()> {
 }
 
 impl State {
-    /// `n` more files of target `ti` are in place.
-    fn landed(&mut self, ti: usize, n: usize) {
+    /// `n` more files of target `ti` are in place. Returns the target when that was
+    /// the last. Only counts: the filesystem work happens outside the lock, since
+    /// the archive filesystem can be very slow and every worker waits on this lock.
+    fn landed(&mut self, ti: usize, n: usize) -> Option<Completion> {
         let t = &mut self.targets[ti];
         t.remaining = t.remaining.saturating_sub(n);
 
-        if t.remaining == 0 {
-            match fs::write(t.dest.join(".complete"), b"") {
-                Ok(()) => {
-                    self.targets_done += 1;
-                    debug!("Complete: {}", t.label);
+        (t.remaining == 0).then(|| Completion {
+            label: t.label.clone(),
+            car: t.car.clone(),
+            fw: t.fw.clone(),
+            dest: t.dest.clone(),
+            ver_written: t.ver_written,
+        })
+    }
+}
+
+/// Write `<id>.ver` for a version, so later runs can find its files.
+fn write_ver(dest: &Path, car: &CarInfo, fw: &FirmwareInfo) -> Result<()> {
+    fs::create_dir_all(dest).with_context(|| format!("Failed to create {dest:?}"))?;
+    let ver = VersionInfo::new(car, fw).to_string();
+    let path = dest.join(format!("{}.ver", car.id));
+
+    fs::write(&path, ver).with_context(|| format!("Failed to write {path:?}"))
+}
+
+/// Mark versions complete. Their manifest goes first if setup hasn't written it yet.
+fn mark_complete(shared: &Shared, completions: Vec<Completion>) {
+    for c in completions {
+        let result = if c.ver_written {
+            Ok(())
+        } else {
+            write_ver(&c.dest, &c.car, &c.fw)
+        }
+        .and_then(|()| {
+            fs::write(c.dest.join(".complete"), b"")
+                .with_context(|| format!("Failed to mark {} complete", c.label))
+        });
+
+        let mut st = shared.state.lock().unwrap();
+        match result {
+            Ok(()) => {
+                st.targets_done += 1;
+                debug!("Complete: {}", c.label);
+            }
+            Err(e) => {
+                warn!("{e:#}");
+                st.failed.push(format!("{}: {e:#}", c.label));
+            }
+        }
+    }
+}
+
+/// Account for a finished job: link its file into every version that waited on it and
+/// complete the versions that now have everything.
+fn finish_job(shared: &Shared, jid: usize, result: Result<()>) {
+    let mut completions = vec![];
+
+    let links: Vec<(usize, PathBuf, PathBuf)> = {
+        let mut st = shared.state.lock().unwrap();
+        st.active -= 1;
+
+        if let Err(e) = result {
+            let label = st.targets[st.jobs[jid].owner].label.clone();
+            st.failed.push(format!("{label}: {e:#}"));
+            warn!("Failed: {label}: {e:#}");
+            return;
+        }
+        st.jobs_done += 1;
+
+        let owner = st.jobs[jid].owner;
+        let waiters = std::mem::take(&mut st.jobs[jid].waiters);
+        let big = match &st.jobs[jid].kind {
+            Kind::Big(fi) => Some(*fi),
+            Kind::Bulk(files) => {
+                let n = files.len();
+                completions.extend(st.landed(owner, n));
+                None
+            }
+        };
+
+        match big {
+            None => vec![],
+            Some(fi) => {
+                let src = st.targets[owner].dest.join(st.targets[owner].fw.files[fi].path());
+                completions.extend(st.landed(owner, 1));
+
+                waiters
+                    .into_iter()
+                    .map(|(wt, wf)| {
+                        let dst = st.targets[wt].dest.join(st.targets[wt].fw.files[wf].path());
+                        (wt, src.clone(), dst)
+                    })
+                    .collect()
+            }
+        }
+    };
+
+    let results: Vec<_> = links
+        .into_iter()
+        .map(|(wt, src, dst)| (wt, hard_link_into(&src, &dst)))
+        .collect();
+    {
+        let mut st = shared.state.lock().unwrap();
+        for (wt, r) in results {
+            match r {
+                Ok(()) => completions.extend(st.landed(wt, 1)),
+                Err(e) => {
+                    let label = st.targets[wt].label.clone();
+                    st.failed.push(format!("{label}: {e:#}"));
                 }
-                Err(e) => warn!("Failed to mark {} complete: {e}", t.label),
             }
         }
     }
 
-    fn finish(&mut self, jid: usize, result: Result<()>) {
-        self.active -= 1;
+    mark_complete(shared, completions);
+}
 
-        if let Err(e) = result {
-            let label = self.targets[self.jobs[jid].owner].label.clone();
-            self.failed.push(format!("{label}: {e:#}"));
-            warn!("Failed: {label}: {e:#}");
+/// Setup that doesn't gate the downloads: write each version's manifest, then link in
+/// the files the archive already holds. Runs beside the workers because the archive
+/// filesystem may be slow, and the scratch tiers don't depend on it.
+fn prepare(shared: &Shared, links: Vec<(usize, PathBuf, PathBuf)>) {
+    let n = shared.state.lock().unwrap().targets.len();
+
+    for ti in 0..n {
+        if shared.stop.load(Ordering::Relaxed) {
             return;
         }
-        self.jobs_done += 1;
-
-        let owner = self.jobs[jid].owner;
-        let waiters = std::mem::take(&mut self.jobs[jid].waiters);
-        match &self.jobs[jid].kind {
-            Kind::Bulk(files) => {
-                let n = files.len();
-                self.landed(owner, n);
-            }
-            Kind::Big(fi) => {
-                let src = self.targets[owner].dest.join(self.targets[owner].fw.files[*fi].path());
-                self.landed(owner, 1);
-
-                for (wt, wf) in waiters {
-                    let dst = self.targets[wt].dest.join(self.targets[wt].fw.files[wf].path());
-                    match hard_link_into(&src, &dst) {
-                        Ok(()) => self.landed(wt, 1),
-                        Err(e) => {
-                            let label = self.targets[wt].label.clone();
-                            self.failed.push(format!("{label}: {e:#}"));
-                        }
-                    }
-                }
+        let todo = {
+            let st = shared.state.lock().unwrap();
+            let t = &st.targets[ti];
+            (t.remaining > 0 && !t.ver_written)
+                .then(|| (t.dest.clone(), t.car.clone(), t.fw.clone()))
+        };
+        if let Some((dest, car, fw)) = todo {
+            match write_ver(&dest, &car, &fw) {
+                Ok(()) => shared.state.lock().unwrap().targets[ti].ver_written = true,
+                Err(e) => warn!("{e:#}"),
             }
         }
+        shared.prep_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    for (ti, src, dst) in links {
+        if shared.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let completion = match hard_link_into(&src, &dst) {
+            Ok(()) => shared.state.lock().unwrap().landed(ti, 1),
+            Err(e) => {
+                warn!("{e:#}");
+                None
+            }
+        };
+        mark_complete(shared, completion.into_iter().collect());
+        shared.prep_done.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -597,7 +718,10 @@ async fn worker(shared: Arc<Shared>, client: Arc<NuClient>) {
         };
 
         let result = run_job(&shared, &client, jid).await;
-        shared.state.lock().unwrap().finish(jid, result);
+        // Links and markers touch the archive filesystem, so keep them off the async
+        // threads.
+        let s = shared.clone();
+        let _ = tokio::task::spawn_blocking(move || finish_job(&s, jid, result)).await;
     }
 }
 
@@ -679,55 +803,64 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
     }
 
     let Plan {
-        mut targets,
+        targets,
         jobs,
         links,
         ..
     } = plan;
 
-    // Write each manifest first so a halted run still tells later ones what is here.
-    for t in targets.iter().filter(|t| t.remaining > 0) {
-        fs::create_dir_all(&t.dest).with_context(|| format!("Failed to create {:?}", t.dest))?;
-        let ver = VersionInfo::new(&t.car, &t.fw).to_string();
-        fs::write(t.dest.join(format!("{}.ver", t.car.id)), ver)?;
-    }
+    // Versions with every file already in place just lack their marker (an earlier
+    // run stopped at the very end).
+    let ready: Vec<Completion> = targets
+        .iter()
+        .filter(|t| t.remaining == 0)
+        .map(|t| Completion {
+            label: t.label.clone(),
+            car: t.car.clone(),
+            fw: t.fw.clone(),
+            dest: t.dest.clone(),
+            ver_written: false,
+        })
+        .collect();
+    // Where each file the archive already holds goes.
+    let link_ops: Vec<(usize, PathBuf, PathBuf)> = links
+        .into_iter()
+        .map(|(ti, fi, src)| {
+            (ti, src, targets[ti].dest.join(targets[ti].fw.files[fi].path()))
+        })
+        .collect();
 
     let tiers = Tiers::new(&cli.stage, cli.headroom_gb * GIB)?;
-    let mut state = State {
-        queue: (0..jobs.len()).collect(),
-        jobs,
-        active: 0,
-        failed: vec![],
-        targets_done: 0,
-        jobs_done: 0,
-        targets: vec![],
-    };
-
-    // Files the archive already holds are linked in now.
-    let mut linked = vec![0usize; targets.len()];
-    for (ti, fi, src) in links {
-        let dst = targets[ti].dest.join(targets[ti].fw.files[fi].path());
-        match hard_link_into(&src, &dst) {
-            Ok(()) => linked[ti] += 1,
-            Err(e) => warn!("{e:#}"),
-        }
-    }
-    state.targets = std::mem::take(&mut targets);
-    for (ti, n) in linked.into_iter().enumerate() {
-        if n > 0 {
-            state.landed(ti, n);
-        }
-    }
-
-    let total_jobs = state.jobs.len();
+    let total_jobs = jobs.len();
+    let prep_total = (targets.len() + link_ops.len()) as u64;
     let shared = Arc::new(Shared {
-        state: Mutex::new(state),
+        state: Mutex::new(State {
+            queue: (0..jobs.len()).collect(),
+            jobs,
+            active: 0,
+            failed: vec![],
+            targets_done: 0,
+            jobs_done: 0,
+            targets,
+        }),
         tiers,
         bytes: AtomicU64::new(0),
         stop: AtomicBool::new(false),
         concurrency: cli.concurrency.0.into(),
         retries: cli.retries,
+        prep_done: AtomicU64::new(0),
+        prep_total,
     });
+
+    // Setup runs beside the workers, so a slow archive filesystem can't hold up
+    // the downloads (which go to the scratch tiers first).
+    let prep = {
+        let shared = shared.clone();
+        tokio::task::spawn_blocking(move || {
+            mark_complete(&shared, ready);
+            prepare(&shared, link_ops);
+        })
+    };
 
     // One client per worker, each through its own proxy when there are proxies.
     let mut set = JoinSet::new();
@@ -748,27 +881,37 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
         tokio::spawn(async move {
             let start = Instant::now();
             loop {
-                tokio::time::sleep(Duration::from_secs(15)).await;
-                let st = shared.state.lock().unwrap();
+                let (jobs_done, active, targets_done) = {
+                    let st = shared.state.lock().unwrap();
+                    (st.jobs_done, st.active, st.targets_done)
+                };
                 let bytes = shared.bytes.load(Ordering::Relaxed);
                 let secs = start.elapsed().as_secs_f64().max(1.0);
+                let prep_done = shared.prep_done.load(Ordering::Relaxed);
+                let prep = if prep_done < shared.prep_total {
+                    format!(", setup {prep_done}/{}", shared.prep_total)
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "sync: {}/{} jobs, {} active, {} versions complete, {} GB downloaded \
-                     ({:.0} MB/s)",
-                    st.jobs_done,
-                    total_jobs,
-                    st.active,
-                    st.targets_done,
+                    "sync: {jobs_done}/{total_jobs} jobs, {active} active, {targets_done} \
+                     versions complete, {} GB downloaded ({:.0} MB/s){prep}",
                     gb(bytes),
                     bytes as f64 / secs / 1e6,
                 );
+                tokio::time::sleep(Duration::from_secs(15)).await;
             }
         })
     };
 
+    let mut prep = prep;
     let interrupted = tokio::select! {
         _ = ctrl_c() => true,
-        _ = async { while set.join_next().await.is_some() {} } => false,
+        _ = async {
+            while set.join_next().await.is_some() {}
+            // Setup may outlast the downloads (a slow archive filesystem).
+            let _ = (&mut prep).await;
+        } => false,
     };
     status.abort();
     if interrupted {
