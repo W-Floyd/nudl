@@ -3,7 +3,7 @@ members = ["xtask"]
 resolver = "2"
 
 [workspace.package]
-version = "1.2.0-fork.10"
+version = "1.2.0-fork.11"
 license = "GPL-3.0-only"
 edition = "2024"
 repository = "https://github.com/chenxiaolong/nudl"
@@ -35,6 +35,8 @@ futures-core = "0.3.30"
 indicatif = "0.18.0"
 jiff = "0.2.1"
 rawzip = { version = "0.5.1" }
+# Only to list a 7z's files (some Mobis "zips" are 7z): no codec beyond what its header needs.
+sevenz-rust2 = { version = "0.20.2", default-features = false }
 reqwest = { version = "0.13.1", features = ["charset", "json", "http2", "rustls-no-provider", "socks", "stream"], default-features = false }
 rustls = { version = "0.23.36", features = ["logging", "ring", "std", "tls12"], default-features = false }
 serde = { version = "1.0.197", features = ["derive"] }

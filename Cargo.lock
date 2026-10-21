@@ -1038,6 +1038,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "lzma-rust2"
+version = "0.16.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca93e534d1142d1d0dcca6d25fe302508a5dfb40b302802904577725ea0b695b"
+
+[[package]]
 name = "maybe-owned"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1087,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "nudl"
-version = "1.2.0-fork.10"
+version = "1.2.0-fork.11"
 dependencies = [
  "aes",
  "anstyle-progress",
@@ -1111,6 +1117,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sevenz-rust2",
  "sha2",
  "thiserror",
  "tokio",
@@ -1183,9 +1190,9 @@ checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "portable-atomic-util"
-version = "0.2.7"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
 dependencies = [
  "portable-atomic",
 ]
@@ -1526,6 +1533,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sevenz-rust2"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29225600349ef74beda5a9fffb36ac660a24613c0bde9315d0c49be1d51e9c24"
+dependencies = [
+ "crc32fast",
+ "js-sys",
+ "lzma-rust2",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1778,9 +1797,9 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.13+spec-1.1.0"
+version = "0.25.15+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
+checksum = "1340ea94a5856333492c9064b02c778b191dd2c853778d9609debdcdfea3a614"
 dependencies = [
  "indexmap",
  "toml_datetime",
@@ -2313,7 +2332,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "1.2.0-fork.10"
+version = "1.2.0-fork.11"
 dependencies = [
  "anyhow",
  "clap",

@@ -10,6 +10,7 @@ mod download;
 #[cfg(unix)]
 mod index;
 mod link;
+mod manifest;
 mod mobis;
 mod model;
 mod notices;

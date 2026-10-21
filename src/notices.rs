@@ -483,6 +483,9 @@ pub async fn sync(
         for z in &n.zips {
             let path = dest(root, n, z);
             if sum_path(&path).exists() && path.exists() {
+                if !plan_only {
+                    crate::manifest::ensure(path).await;
+                }
                 continue;
             }
 
@@ -508,6 +511,7 @@ pub async fn sync(
                 Ok(sum) => {
                     let line = format!("{sum}  {}\n", z.name);
                     tokio::fs::write(sum_path(&path), line).await?;
+                    crate::manifest::ensure(path).await;
                 }
                 Err(e) => failed.push(format!("{}: {e:#}", z.name)),
             }

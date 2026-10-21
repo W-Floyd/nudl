@@ -219,8 +219,10 @@ async fn fetch_retrying(client: &NuClient, file: &File, path: &Path, retries: u8
         match fetch(client, file, path).await {
             Ok(sum) => {
                 let line = format!("{sum}  {}\n", file.name);
+                tokio::fs::write(sum_path(path), line).await?;
+                crate::manifest::ensure(path.to_path_buf()).await;
 
-                return Ok(tokio::fs::write(sum_path(path), line).await?);
+                return Ok(());
             }
             Err(e) if attempt < retries => {
                 attempt += 1;
@@ -284,6 +286,14 @@ pub async fn sync(
     while let Some(r) = set.join_next().await {
         if let (file, Err(e)) = r?? {
             failed.push(format!("{}: {e:#}", file.name));
+        }
+    }
+
+    // Zips from before manifests, or whose manifest could not be written then.
+    for file in packages.iter().flat_map(|p| &p.files).collect::<std::collections::BTreeSet<_>>() {
+        let path = file.path(root);
+        if sum_path(&path).exists() && path.exists() {
+            crate::manifest::ensure(path).await;
         }
     }
 
