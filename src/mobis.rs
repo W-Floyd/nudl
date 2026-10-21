@@ -172,6 +172,26 @@ fn sum_path(zip: &Path) -> PathBuf {
     PathBuf::from(format!("{}.sha256", zip.display()))
 }
 
+/// What a file request answers when the file is not there: the site's own 404 page, with a
+/// 200 status.
+#[derive(Debug)]
+struct WebPage;
+
+impl std::fmt::Display for WebPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server sent a web page, not the file (it is gone, or the id is wrong)")
+    }
+}
+
+impl std::error::Error for WebPage {}
+
+fn is_web_page(head: &[u8]) -> bool {
+    let head = head.strip_prefix(b"\xef\xbb\xbf").unwrap_or(head);
+    let head = head.trim_ascii_start().to_ascii_lowercase();
+
+    head.starts_with(b"<!doctype html") || head.starts_with(b"<html")
+}
+
 async fn fetch(client: &NuClient, file: &File, path: &Path) -> Result<String> {
     let part = PathBuf::from(format!("{}.part", path.display()));
     let r = client
@@ -186,19 +206,27 @@ async fn fetch(client: &NuClient, file: &File, path: &Path) -> Result<String> {
     let mut out = tokio::fs::File::create(&part)
         .await
         .with_context(|| format!("Failed to create {part:?}"))?;
-    let (mut hasher, mut size) = (Sha256::new(), 0u64);
+    let (mut hasher, mut size, mut head) = (Sha256::new(), 0u64, vec![]);
     let mut stream = r.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         hasher.update(&chunk);
         out.write_all(&chunk).await?;
         size += chunk.len() as u64;
+        if head.len() < 64 {
+            head.extend_from_slice(&chunk[..chunk.len().min(64 - head.len())]);
+        }
     }
     out.flush().await?;
     // An unknown file id gets an empty 200 rather than an error.
     if size == 0 {
         let _ = tokio::fs::remove_file(&part).await;
         bail!("Empty response");
+    }
+    // A missing one, a 200 with the site's 404 page.
+    if is_web_page(&head) {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(WebPage.into());
     }
     tokio::fs::rename(&part, path)
         .await
@@ -221,6 +249,12 @@ async fn fetch_retrying(client: &NuClient, file: &File, path: &Path, retries: u8
                 let line = format!("{sum}  {}\n", file.name);
                 tokio::fs::write(sum_path(path), line).await?;
                 crate::manifest::ensure(path.to_path_buf()).await;
+
+                return Ok(());
+            }
+            // Not worth retrying, and not a failure of the run: it is asked for again next time.
+            Err(e) if e.is::<WebPage>() => {
+                warn!("{}: {e:#}; skipped", file.name);
 
                 return Ok(());
             }
@@ -315,6 +349,16 @@ pub async fn sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tells_a_web_page_from_a_file() {
+        assert!(is_web_page(b"<!DOCTYPE html>\n<html lang=\"ko\">"));
+        assert!(is_web_page(b"\xef\xbb\xbf  \n<HTML>"));
+        assert!(!is_web_page(b"PK\x03\x04"));
+        assert!(!is_web_page(b"7z\xbc\xaf\x27\x1c"));
+        assert!(!is_web_page(b"\x89PNG\r\n\x1a\n"));
+        assert!(!is_web_page(b""));
+    }
 
     #[test]
     fn finds_models() {
