@@ -531,6 +531,11 @@ pub struct OpensourceCli {
     #[arg(short, long)]
     pub brand: Vec<Brand>,
 
+    /// Files downloading at once per brand, spread over the proxies. The brands
+    /// download at the same time.
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    pub workers: usize,
+
     /// Parallel ranges per large file, spread over the proxies. Hyundai's server can't
     /// split a file, so its are fetched whole.
     ///

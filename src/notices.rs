@@ -163,6 +163,7 @@ pub(crate) fn sum_path(zip: &Path) -> PathBuf {
     PathBuf::from(format!("{}.sha256", zip.display()))
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Head {
     pub(crate) size: u64,
     /// The server's own SHA-256, when it publishes one.

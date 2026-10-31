@@ -484,7 +484,7 @@ async fn opensource_subcommand(cli: &OpensourceCli) -> Result<()> {
     let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
 
     if let Some(root) = &cli.download {
-        opensource::sync(&client, root, &cli.brand, false, cli.concurrency.0.into(), cli.retries).await?;
+        opensource::sync(&client, root, &cli.brand, false, cli.workers, cli.concurrency.0.into(), cli.retries).await?;
 
         return Ok(());
     }

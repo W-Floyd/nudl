@@ -24,6 +24,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use reqwest::{StatusCode, header};
 use serde::Deserialize;
+use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::warn;
 
 use crate::{cli::Brand, client::NuClient, mobis, notices};
@@ -285,13 +286,44 @@ async fn fetch_whole(client: &NuClient, url: &str, referer: &str, path: &Path, r
     }
 }
 
-/// Bring `brand`'s files into its folder. With `plan_only`, report what is missing and
-/// stop. Returns the number fetched (or that would be).
+/// One file to fetch: where it goes, and its length when the server gives one.
+struct Job {
+    url: String,
+    name: String,
+    path: PathBuf,
+    head: Option<notices::Head>,
+}
+
+/// Fetch a job's file and write its checksum (and a zip's manifest) beside it. `false`
+/// when the server sent a web page, not the file.
+async fn run(client: &Arc<NuClient>, job: &Job, referer: &str, connections: usize, retries: u8) -> Result<bool> {
+    let parent = job.path.parent().expect("has a parent");
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("Failed to create {parent:?}"))?;
+    let sum = match &job.head {
+        Some(head) => Some(notices::fetch(client, &job.url, &job.path, head, connections, retries).await?),
+        None => fetch_whole(client, &job.url, referer, &job.path, retries).await?,
+    };
+    let Some(sum) = sum else { return Ok(false) };
+    tokio::fs::write(notices::sum_path(&job.path), format!("{sum}  {}\n", job.name)).await?;
+    // A licence notice is text, so has no manifest.
+    if job.name.to_ascii_lowercase().ends_with(".zip") {
+        crate::manifest::ensure(job.path.clone()).await;
+    }
+
+    Ok(true)
+}
+
+/// Bring `brand`'s files into its folder, `workers` at a time (each request goes to the
+/// next proxy). With `plan_only`, report what is missing and stop. Returns the number
+/// fetched (or that would be).
 async fn sync_brand(
-    client: &Arc<NuClient>,
-    root: &Path,
+    client: Arc<NuClient>,
+    root: PathBuf,
     brand: Brand,
     plan_only: bool,
+    workers: usize,
     connections: usize,
     retries: u8,
 ) -> Result<usize> {
@@ -301,24 +333,22 @@ async fn sync_brand(
         Brand::Hyundai => HYUNDAI_PAGE,
         Brand::Genesis => GENESIS_PAGE,
     };
-    let packages = list(client, brand).await?;
-    let dir = dir(root, brand);
-    let (mut todo, mut fetched, mut skipped, mut bytes, mut failed) = (0, 0, 0, 0u64, vec![]);
+    let packages = list(&client, brand).await?;
+    let dir = dir(&root, brand);
+    let (mut jobs, mut bytes, mut failed) = (vec![], 0u64, vec![]);
 
     for p in &packages {
         for f in &p.files {
             let path = dir.join(&p.id).join(&f.name);
-            // A licence notice is text, so has no manifest.
-            let is_zip = f.name.to_ascii_lowercase().ends_with(".zip");
             if notices::sum_path(&path).exists() && path.exists() {
-                if !plan_only && is_zip {
+                if !plan_only && f.name.to_ascii_lowercase().ends_with(".zip") {
                     crate::manifest::ensure(path).await;
                 }
                 continue;
             }
 
             let head = if ranged(brand) {
-                match notices::head(client, &f.url).await {
+                match notices::head(&client, &f.url).await {
                     Ok(h) => Some(h),
                     // Listed but not stored; not a failure of the run, and asked for again next time.
                     Err(e) if is_not_found(&e) => {
@@ -333,55 +363,49 @@ async fn sync_brand(
             } else {
                 None
             };
-            todo += 1;
-            let size = head.as_ref().map(|h| h.size);
-            bytes += size.unwrap_or(0);
-            match size {
-                Some(size) => eprintln!("{tag}: {} {} ({} MB)", p.title, f.name, size / 1_000_000),
+            match head.as_ref().map(|h| h.size) {
+                Some(size) => {
+                    bytes += size;
+                    eprintln!("{tag}: {} {} ({} MB)", p.title, f.name, size / 1_000_000);
+                }
                 None => eprintln!("{tag}: {} {}", p.title, f.name),
             }
-            if plan_only {
-                continue;
-            }
-
-            let parent = path.parent().expect("has a parent");
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("Failed to create {parent:?}"))?;
-            let sum = match &head {
-                Some(head) => notices::fetch(client, &f.url, &path, head, connections, retries).await.map(Some),
-                None => fetch_whole(client, &f.url, referer, &path, retries).await,
-            };
-            match sum {
-                Ok(Some(sum)) => {
-                    fetched += 1;
-                    tokio::fs::write(notices::sum_path(&path), format!("{sum}  {}\n", f.name)).await?;
-                    if is_zip {
-                        crate::manifest::ensure(path).await;
-                    }
-                }
-                Ok(None) => {
-                    skipped += 1;
-                    warn!("{tag}: {}: the server sent a web page, not the file; skipped", f.url);
-                }
-                Err(e) => failed.push(format!("{}: {e:#}", f.url)),
-            }
+            jobs.push(Job { url: f.url.clone(), name: f.name.clone(), path, head });
         }
     }
+
     let size = if ranged(brand) { format!(" ({} GB)", bytes / 1_000_000_000) } else { String::new() };
     if plan_only {
-        eprintln!("{tag}: {} models, {todo} files to download{size}", packages.len());
-    } else {
-        eprintln!(
-            "{tag}: {} models, {fetched} files downloaded{size}, {skipped} skipped",
-            packages.len(),
-        );
+        eprintln!("{tag}: {} models, {} files to download{size}", packages.len(), jobs.len());
+        return Ok(jobs.len());
     }
 
-    if !plan_only {
-        tokio::fs::create_dir_all(&dir).await?;
-        tokio::fs::write(dir.join("index.tsv"), index_tsv(&packages)).await?;
+    let permits = Arc::new(Semaphore::new(workers.max(1)));
+    let mut set = JoinSet::new();
+    for job in jobs {
+        let (client, permits) = (client.clone(), permits.clone());
+        set.spawn(async move {
+            let _permit = permits.acquire().await?;
+            let r = run(&client, &job, referer, connections, retries).await;
+
+            anyhow::Ok((job, r))
+        });
     }
+    let (mut fetched, mut skipped) = (0, 0);
+    while let Some(r) = set.join_next().await {
+        match r?? {
+            (_, Ok(true)) => fetched += 1,
+            (job, Ok(false)) => {
+                skipped += 1;
+                warn!("{tag}: {}: the server sent a web page, not the file; skipped", job.url);
+            }
+            (job, Err(e)) => failed.push(format!("{}: {e:#}", job.url)),
+        }
+    }
+    eprintln!("{tag}: {} models, {fetched} files downloaded{size}, {skipped} skipped", packages.len());
+
+    tokio::fs::create_dir_all(&dir).await?;
+    tokio::fs::write(dir.join("index.tsv"), index_tsv(&packages)).await?;
 
     if !failed.is_empty() {
         for f in &failed {
@@ -390,25 +414,31 @@ async fn sync_brand(
         bail!("{} {} open-source downloads failed; rerun to retry", failed.len(), brand.as_pretty_str());
     }
 
-    Ok(if plan_only { todo } else { fetched })
+    Ok(fetched)
 }
 
-/// [`sync_brand`] for each of `brands`, all of them if empty. One brand failing doesn't
-/// stop the rest.
+/// [`sync_brand`] for each of `brands` (all of them if empty) at once: they are separate
+/// servers. One brand failing doesn't stop the rest.
 pub async fn sync(
     client: &Arc<NuClient>,
     root: &Path,
     brands: &[Brand],
     plan_only: bool,
+    workers: usize,
     connections: usize,
     retries: u8,
 ) -> Result<usize> {
     let all = [Brand::Hyundai, Brand::Kia, Brand::Genesis];
     let brands = if brands.is_empty() { &all[..] } else { brands };
 
-    let (mut todo, mut first_err) = (0, None);
+    let mut set = JoinSet::new();
     for &brand in brands {
-        match sync_brand(client, root, brand, plan_only, connections, retries).await {
+        let (client, root) = (client.clone(), root.to_path_buf());
+        set.spawn(sync_brand(client, root, brand, plan_only, workers, connections, retries));
+    }
+    let (mut todo, mut first_err) = (0, None);
+    while let Some(r) = set.join_next().await {
+        match r? {
             Ok(n) => todo += n,
             Err(e) => {
                 first_err.get_or_insert(e);

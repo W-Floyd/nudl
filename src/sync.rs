@@ -917,75 +917,51 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
     // Planning only reads, so it can run beside a live sync; a real run takes the lock.
     let _lock = if cli.plan { None } else { Some(lock(&root)?) };
 
-    // Notice zips are a separate source, so their failure doesn't stop the rest.
-    let notices_err = if wants_notices(cli) {
-        let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
-        let run = notices::sync(&client, &root, cli.plan, cli.concurrency.0.into(), cli.retries);
-        let result = tokio::select! {
-            r = run => r,
-            _ = ctrl_c() => {
-                eprintln!("Interrupted. Rerun the same command to resume.");
-                std::process::exit(130);
-            }
-        };
-
+    // The sources besides the firmware are separate servers, so they download at once; their
+    // failure doesn't stop the rest.
+    let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
+    let notices_run = async {
+        if wants_notices(cli) {
+            Some(notices::sync(&client, &root, cli.plan, cli.concurrency.0.into(), cli.retries).await)
+        } else {
+            None
+        }
+    };
+    let mobis_run = async {
+        if !cli.no_mobis && cli.model.is_empty() {
+            Some(mobis::sync(&client, &root, cli.plan, cli.workers, cli.retries).await)
+        } else {
+            None
+        }
+    };
+    let opensource_run = async {
+        if !cli.no_opensource && cli.model.is_empty() {
+            Some(
+                opensource::sync(&client, &root, &cli.brand, cli.plan, cli.workers, cli.concurrency.0.into(), cli.retries)
+                    .await,
+            )
+        } else {
+            None
+        }
+    };
+    let results = tokio::select! {
+        r = async { tokio::join!(notices_run, mobis_run, opensource_run) } => r,
+        _ = ctrl_c() => {
+            eprintln!("Interrupted. Rerun the same command to resume.");
+            std::process::exit(130);
+        }
+    };
+    let mut notices_err = None;
+    for (what, result) in [("Notice", results.0), ("Mobis", results.1), ("Open-source", results.2)] {
         match result {
-            Ok(_) => None,
-            Err(e) if cli.plan => return Err(e),
-            Err(e) => {
-                warn!("Notice downloads: {e:#}");
-                Some(e)
+            None | Some(Ok(_)) => {}
+            Some(Err(e)) if cli.plan => return Err(e),
+            Some(Err(e)) => {
+                warn!("{what} downloads: {e:#}");
+                notices_err.get_or_insert(e);
             }
         }
-    } else {
-        None
-    };
-
-    let mobis_err = if !cli.no_mobis && cli.model.is_empty() {
-        let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
-        let run = mobis::sync(&client, &root, cli.plan, cli.workers, cli.retries);
-        let result = tokio::select! {
-            r = run => r,
-            _ = ctrl_c() => {
-                eprintln!("Interrupted. Rerun the same command to resume.");
-                std::process::exit(130);
-            }
-        };
-
-        match result {
-            Ok(_) => None,
-            Err(e) if cli.plan => return Err(e),
-            Err(e) => {
-                warn!("Mobis downloads: {e:#}");
-                Some(e)
-            }
-        }
-    } else {
-        None
-    };
-    let opensource_err = if !cli.no_opensource && cli.model.is_empty() {
-        let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
-        let run = opensource::sync(&client, &root, &cli.brand, cli.plan, cli.concurrency.0.into(), cli.retries);
-        let result = tokio::select! {
-            r = run => r,
-            _ = ctrl_c() => {
-                eprintln!("Interrupted. Rerun the same command to resume.");
-                std::process::exit(130);
-            }
-        };
-
-        match result {
-            Ok(_) => None,
-            Err(e) if cli.plan => return Err(e),
-            Err(e) => {
-                warn!("Open-source downloads: {e:#}");
-                Some(e)
-            }
-        }
-    } else {
-        None
-    };
-    let notices_err = notices_err.or(mobis_err).or(opensource_err);
+    }
 
     let plan = make_plan(cli, &root).await?;
     let free = report(&plan, &root);
