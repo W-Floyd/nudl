@@ -210,6 +210,8 @@ pub(crate) async fn fetch(client: &NuClient, url: &str, referer: &str, path: &Pa
         .with_context(|| format!("Failed to create {part:?}"))?;
     let (mut hasher, mut size, mut head) = (Sha256::new(), 0u64, vec![]);
     let mut stream = r.bytes_stream();
+    // With no length to show a bar against, a large file would otherwise be silent until done.
+    let mut last = std::time::Instant::now();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         hasher.update(&chunk);
@@ -217,6 +219,11 @@ pub(crate) async fn fetch(client: &NuClient, url: &str, referer: &str, path: &Pa
         size += chunk.len() as u64;
         if head.len() < 64 {
             head.extend_from_slice(&chunk[..chunk.len().min(64 - head.len())]);
+        }
+        if last.elapsed() >= std::time::Duration::from_secs(30) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            eprintln!("{name}: {} MB so far", size / 1_000_000);
+            last = std::time::Instant::now();
         }
     }
     out.flush().await?;
@@ -237,7 +244,8 @@ pub(crate) async fn fetch(client: &NuClient, url: &str, referer: &str, path: &Pa
     Ok(hex(&hasher.finalize()))
 }
 
-async fn fetch_retrying(client: &NuClient, file: &File, path: &Path, retries: u8) -> Result<()> {
+/// Whether the file was fetched; false when the server no longer has it.
+async fn fetch_retrying(client: &NuClient, file: &File, path: &Path, retries: u8) -> Result<bool> {
     if let Some(dir) = path.parent() {
         tokio::fs::create_dir_all(dir)
             .await
@@ -252,13 +260,13 @@ async fn fetch_retrying(client: &NuClient, file: &File, path: &Path, retries: u8
                 tokio::fs::write(sum_path(path), line).await?;
                 crate::manifest::ensure(path.to_path_buf()).await;
 
-                return Ok(());
+                return Ok(true);
             }
             // Not worth retrying, and not a failure of the run: it is asked for again next time.
             Err(e) if e.is::<WebPage>() => {
                 warn!("{}: {e:#}; skipped", file.name);
 
-                return Ok(());
+                return Ok(false);
             }
             Err(e) if attempt < retries => {
                 attempt += 1;
@@ -364,10 +372,12 @@ pub async fn sync(
             anyhow::Ok((file, r))
         });
     }
-    let mut failed = vec![];
+    let (mut failed, mut fetched) = (vec![], 0);
     while let Some(r) = set.join_next().await {
-        if let (file, Err(e)) = r?? {
-            failed.push(format!("{}: {e:#}", file.name));
+        match r?? {
+            (_, Ok(true)) => fetched += 1,
+            (_, Ok(false)) => {}
+            (file, Err(e)) => failed.push(format!("{}: {e:#}", file.name)),
         }
     }
 
@@ -389,9 +399,9 @@ pub async fn sync(
         }
         bail!("{} Mobis downloads failed; rerun to retry", failed.len());
     }
-    eprintln!("mobis: {} downloaded", todo.len());
+    eprintln!("mobis: {fetched} downloaded, {} skipped", todo.len() - fetched);
 
-    Ok(todo.len())
+    Ok(fetched)
 }
 
 #[cfg(test)]

@@ -303,7 +303,7 @@ async fn sync_brand(
     };
     let packages = list(client, brand).await?;
     let dir = dir(root, brand);
-    let (mut todo, mut bytes, mut failed) = (0, 0u64, vec![]);
+    let (mut todo, mut fetched, mut skipped, mut bytes, mut failed) = (0, 0, 0, 0u64, vec![]);
 
     for p in &packages {
         for f in &p.files {
@@ -354,22 +354,29 @@ async fn sync_brand(
             };
             match sum {
                 Ok(Some(sum)) => {
+                    fetched += 1;
                     tokio::fs::write(notices::sum_path(&path), format!("{sum}  {}\n", f.name)).await?;
                     if is_zip {
                         crate::manifest::ensure(path).await;
                     }
                 }
-                Ok(None) => warn!("{tag}: {}: the server sent a web page, not the file; skipped", f.url),
+                Ok(None) => {
+                    skipped += 1;
+                    warn!("{tag}: {}: the server sent a web page, not the file; skipped", f.url);
+                }
                 Err(e) => failed.push(format!("{}: {e:#}", f.url)),
             }
         }
     }
-    eprintln!(
-        "{tag}: {} models, {todo} files {}{}",
-        packages.len(),
-        if plan_only { "to download" } else { "downloaded" },
-        if ranged(brand) { format!(" ({} GB)", bytes / 1_000_000_000) } else { String::new() },
-    );
+    let size = if ranged(brand) { format!(" ({} GB)", bytes / 1_000_000_000) } else { String::new() };
+    if plan_only {
+        eprintln!("{tag}: {} models, {todo} files to download{size}", packages.len());
+    } else {
+        eprintln!(
+            "{tag}: {} models, {fetched} files downloaded{size}, {skipped} skipped",
+            packages.len(),
+        );
+    }
 
     if !plan_only {
         tokio::fs::create_dir_all(&dir).await?;
@@ -383,7 +390,7 @@ async fn sync_brand(
         bail!("{} {} open-source downloads failed; rerun to retry", failed.len(), brand.as_pretty_str());
     }
 
-    Ok(todo)
+    Ok(if plan_only { todo } else { fetched })
 }
 
 /// [`sync_brand`] for each of `brands`, all of them if empty. One brand failing doesn't
