@@ -14,6 +14,7 @@ mod manifest;
 mod mobis;
 mod model;
 mod notices;
+mod opensource;
 mod progress;
 #[cfg(unix)]
 mod relink;
@@ -39,7 +40,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     cli::{
-        Brand, Cli, Command, DownloadCli, ListCli, MobisCli, NetworkGroup, NoticesCli,
+        Brand, Cli, Command, DownloadCli, ListCli, MobisCli, NetworkGroup, NoticesCli, OpensourceCli,
         OutputFormat, VerifyCli, default_cache_dir,
     },
     client::{Cache, CarInfo, NuClient, NuClientBuilder},
@@ -479,6 +480,27 @@ async fn mobis_subcommand(cli: &MobisCli) -> Result<()> {
     Ok(())
 }
 
+async fn opensource_subcommand(cli: &OpensourceCli) -> Result<()> {
+    let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
+
+    if let Some(root) = &cli.download {
+        opensource::sync(&client, root, &cli.brand, false, cli.concurrency.0.into(), cli.retries).await?;
+
+        return Ok(());
+    }
+
+    let all = [Brand::Hyundai, Brand::Kia, Brand::Genesis];
+    for &brand in if cli.brand.is_empty() { &all[..] } else { &cli.brand } {
+        for p in opensource::list(&client, brand).await? {
+            for f in &p.files {
+                println!("{}\t{}\t{}\t{}", brand.as_pretty_str(), p.id, p.title, f.url);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn notices_subcommand(cli: &NoticesCli) -> Result<()> {
     let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
 
@@ -522,6 +544,7 @@ async fn main() -> Result<()> {
         Command::Sync(c) => sync::run(c).await,
         Command::Notices(c) => notices_subcommand(c).await,
         Command::Mobis(c) => mobis_subcommand(c).await,
+        Command::Opensource(c) => opensource_subcommand(c).await,
         #[cfg(unix)]
         Command::Relink(c) => relink::run(c),
         #[cfg(not(unix))]

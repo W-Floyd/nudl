@@ -11,7 +11,7 @@
 //!
 //! Zips land in `<root>/mobis/<file id>/<stored name>` with `<stored name>.sha256`
 //! once whole (many models share a file, so it is keyed by id), and
-//! `<root>/mobis/index.tsv` maps model and platform to them.
+//! `<root>/mobis/index.tsv` maps model, platform and brand to them.
 
 use std::{
     collections::BTreeMap,
@@ -175,7 +175,7 @@ fn sum_path(zip: &Path) -> PathBuf {
 /// What a file request answers when the file is not there: the site's own 404 page, with a
 /// 200 status.
 #[derive(Debug)]
-struct WebPage;
+pub(crate) struct WebPage;
 
 impl std::fmt::Display for WebPage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -192,13 +192,15 @@ fn is_web_page(head: &[u8]) -> bool {
     head.starts_with(b"<!doctype html") || head.starts_with(b"<html")
 }
 
-async fn fetch(client: &NuClient, file: &File, path: &Path) -> Result<String> {
+/// Fetch `url` whole into `path` and return the SHA-256, for a server that sends no length
+/// and ignores ranges.
+pub(crate) async fn fetch(client: &NuClient, url: &str, referer: &str, path: &Path) -> Result<String> {
     let part = PathBuf::from(format!("{}.part", path.display()));
     let r = client
         .client()
-        .get(file.url())
+        .get(url)
         .header(header::USER_AGENT, AGENT)
-        .header(header::REFERER, PAGE)
+        .header(header::REFERER, referer)
         .send()
         .await?
         .error_for_status()?;
@@ -244,7 +246,7 @@ async fn fetch_retrying(client: &NuClient, file: &File, path: &Path, retries: u8
 
     let mut attempt = 0;
     loop {
-        match fetch(client, file, path).await {
+        match fetch(client, &file.url(), PAGE, path).await {
             Ok(sum) => {
                 let line = format!("{sum}  {}\n", file.name);
                 tokio::fs::write(sum_path(path), line).await?;
@@ -268,11 +270,52 @@ async fn fetch_retrying(client: &NuClient, file: &File, path: &Path, retries: u8
     }
 }
 
+/// Model families by brand. Mobis lists models alone (`EV6 ME (CV1)`), never whose they are.
+/// A model Mobis adds that none of these starts gets no brand until it is added here.
+const FAMILIES: &[(&str, &str)] = &[
+    ("ALCAZAR", "hyundai"), ("AVANTE", "hyundai"), ("AZERA", "hyundai"), ("BAYON", "hyundai"),
+    ("CASPER", "hyundai"), ("COUNTY", "hyundai"), ("CRETA", "hyundai"), ("ELANTRA", "hyundai"),
+    ("ELECTRIC BUS", "hyundai"), ("EXTER", "hyundai"), ("GRAND I10", "hyundai"), ("GRANDEUR", "hyundai"),
+    ("HB20", "hyundai"), ("HEAVY-DUTY TRK", "hyundai"), ("I10", "hyundai"), ("I20", "hyundai"),
+    ("I30", "hyundai"), ("INSTER", "hyundai"), ("IONIQ", "hyundai"), ("KONA", "hyundai"),
+    ("MIGHTY", "hyundai"), ("NEXO", "hyundai"), ("PALISADE", "hyundai"), ("PAVISE", "hyundai"),
+    ("PORTER", "hyundai"), ("SANTAFE", "hyundai"), ("SOLARIS", "hyundai"), ("SOLATI", "hyundai"),
+    ("SONATA", "hyundai"), ("STARGAZER", "hyundai"), ("STARIA", "hyundai"), ("TUCSON", "hyundai"),
+    ("UNIVERSE", "hyundai"), ("VELOSTER", "hyundai"), ("VENUE", "hyundai"), ("VERNA", "hyundai"),
+    ("XCIENT", "hyundai"),
+    ("BONGO", "kia"), ("CADENZA", "kia"), ("CARENS", "kia"), ("CARNIVAL", "kia"),
+    ("GRAND CARNIVAL", "kia"), ("CEED", "kia"), ("EV2", "kia"), ("EV3", "kia"), ("EV4", "kia"),
+    ("EV5", "kia"), ("EV6", "kia"), ("EV9", "kia"), ("FORTE", "kia"), ("GRANBIRD", "kia"),
+    ("K3", "kia"), ("K4", "kia"), ("K5", "kia"), ("K7", "kia"), ("K8", "kia"), ("K9", "kia"),
+    ("MOHAVE", "kia"), ("MORNING", "kia"), ("NIRO", "kia"), ("PV5", "kia"), ("RAY", "kia"),
+    ("RIO", "kia"), ("SELTOS", "kia"), ("SONET", "kia"), ("SORENTO", "kia"), ("SOUL", "kia"),
+    ("SPORTAGE", "kia"), ("STINGER", "kia"), ("STONIC", "kia"), ("SYROS", "kia"), ("TASMAN", "kia"),
+    ("TELLURIDE", "kia"),
+    ("G70", "genesis"), ("G80", "genesis"), ("G90", "genesis"), ("GV60", "genesis"),
+    ("GV70", "genesis"), ("GV80", "genesis"), ("GV90", "genesis"),
+];
+
+/// The brand of a Mobis model, by the longest family its name starts with as a word
+/// (`BONGO-3 EV`, `GRAND I10`); "" if none does.
+fn brand(model: &str) -> &'static str {
+    let model = model.to_ascii_uppercase();
+
+    FAMILIES
+        .iter()
+        .filter(|(f, _)| {
+            model
+                .strip_prefix(f)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '-']))
+        })
+        .max_by_key(|(f, _)| f.len())
+        .map_or("", |(_, b)| b)
+}
+
 fn index_tsv(packages: &[Package]) -> String {
-    let mut s = String::from("model\tplatform\tfile id\tname\n");
+    let mut s = String::from("model\tplatform\tfile id\tname\tbrand\n");
     for p in packages {
         for f in &p.files {
-            let _ = writeln!(s, "{}\t{}\t{}\t{}", p.model, p.platform, f.id, f.name);
+            let _ = writeln!(s, "{}\t{}\t{}\t{}\t{}", p.model, p.platform, f.id, f.name, brand(&p.model));
         }
     }
 
@@ -295,6 +338,11 @@ pub async fn sync(
         .filter(|f| !(sum_path(&f.path(root)).exists() && f.path(root).exists()))
         .cloned()
         .collect();
+    let mut unknown: Vec<&str> = packages.iter().map(|p| p.model.as_str()).filter(|m| brand(m).is_empty()).collect();
+    unknown.dedup();
+    if !unknown.is_empty() {
+        warn!("mobis: no brand known for {}; add them to mobis::FAMILIES", unknown.join(", "));
+    }
     eprintln!(
         "mobis: {} models' packages, {} distinct files, {} to download",
         packages.len(),
@@ -358,6 +406,26 @@ mod tests {
         assert!(!is_web_page(b"7z\xbc\xaf\x27\x1c"));
         assert!(!is_web_page(b"\x89PNG\r\n\x1a\n"));
         assert!(!is_web_page(b""));
+    }
+
+    #[test]
+    fn brands() {
+        for (model, want) in [
+            ("EV6 ME (CV1)", "kia"),
+            ("IONIQ 5 USA ROBO-TAXI (NE1aW)", "hyundai"),
+            ("GRAND I10 (AI3)", "hyundai"),
+            ("I10 (AC3)", "hyundai"),
+            ("GRAND CARNIVAL INDIA (YPi)", "kia"),
+            ("BONGO-3 EV (PUEV)", "kia"),
+            ("PORTER-II (HR)", "hyundai"),
+            ("HEAVY-DUTY TRK FCEV (QZFC)", "hyundai"),
+            ("G70 SHOOTING BRAKE BR (IK SB)", "genesis"),
+            ("K3 MEXICO (BL7m)", "kia"),
+            ("K30 (XX)", ""),
+            ("TY (TY)", ""),
+        ] {
+            assert_eq!(brand(model), want, "{model}");
+        }
     }
 
     #[test]

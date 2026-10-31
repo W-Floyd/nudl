@@ -458,6 +458,13 @@ pub struct SyncCli {
     #[arg(long)]
     pub no_mobis: bool,
 
+    /// Skip each brand's own open-source distributions (its site's opensource page).
+    ///
+    /// Source zip and licence notice per model, for the brands synced; they go in
+    /// `<root>/opensource/<brand>/`, see `nudl opensource`. Also skipped with `--model`.
+    #[arg(long)]
+    pub no_opensource: bool,
+
     #[command(flatten)]
     pub network: NetworkGroup,
 }
@@ -502,6 +509,36 @@ pub struct MobisCli {
     pub workers: usize,
 
     /// Maximum retries per file.
+    #[arg(long, default_value = "3")]
+    pub retries: u8,
+
+    #[command(flatten)]
+    pub network: NetworkGroup,
+}
+
+/// List each brand's own open-source distributions, or download them.
+///
+/// One row per file: brand, model id, model name, file URL. Separate from Mobis's
+/// per-platform packages. `--download` fetches them into `<DIR>/opensource/<brand>/<id>/`,
+/// with an `index.tsv` per brand.
+#[derive(Debug, Parser)]
+pub struct OpensourceCli {
+    /// Download the files missing from `<DIR>/opensource/` instead of listing.
+    #[arg(long, value_name = "DIR")]
+    pub download: Option<PathBuf>,
+
+    /// Brands to list or download. Default: all.
+    #[arg(short, long)]
+    pub brand: Vec<Brand>,
+
+    /// Parallel ranges per large file, spread over the proxies. Hyundai's server can't
+    /// split a file, so its are fetched whole.
+    ///
+    /// The maximum concurrency allowed is 16.
+    #[arg(short, long, default_value = "8")]
+    pub concurrency: Concurrency,
+
+    /// Maximum retries during download.
     #[arg(long, default_value = "3")]
     pub retries: u8,
 
@@ -566,6 +603,7 @@ pub enum Command {
     Sync(SyncCli),
     Notices(NoticesCli),
     Mobis(MobisCli),
+    Opensource(OpensourceCli),
     Relink(RelinkCli),
     Index(IndexCli),
 }

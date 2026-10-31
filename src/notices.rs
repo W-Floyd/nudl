@@ -159,17 +159,17 @@ fn dest(root: &Path, notice: &Notice, zip: &Zip) -> PathBuf {
     root.join("notices").join(&notice.id).join(&zip.name)
 }
 
-fn sum_path(zip: &Path) -> PathBuf {
+pub(crate) fn sum_path(zip: &Path) -> PathBuf {
     PathBuf::from(format!("{}.sha256", zip.display()))
 }
 
-struct Head {
-    size: u64,
+pub(crate) struct Head {
+    pub(crate) size: u64,
     /// The server's own SHA-256, when it publishes one.
     sha256: Option<String>,
 }
 
-async fn head(client: &NuClient, url: &str) -> Result<Head> {
+pub(crate) async fn head(client: &NuClient, url: &str) -> Result<Head> {
     let r = client
         .client()
         .head(url)
@@ -357,7 +357,7 @@ async fn fetch_split(
 /// Fetch `url` into `path` and return the SHA-256 of the result. A large file is
 /// split over `connections` ranges; either way an interrupted run resumes from what
 /// reached the disk.
-async fn fetch(
+pub(crate) async fn fetch(
     client: &Arc<NuClient>,
     url: &str,
     path: &Path,

@@ -32,7 +32,7 @@ use crate::{
     cli::{Brand, SyncCli},
     client::{self, CarInfo, FileInfo, FirmwareInfo, NuClient},
     download::{Downloader, ProgressMessage},
-    link, mobis, notices, prepare_client,
+    link, mobis, notices, opensource, prepare_client,
     version::VersionInfo,
 };
 
@@ -963,7 +963,29 @@ pub async fn run(cli: &SyncCli) -> Result<()> {
     } else {
         None
     };
-    let notices_err = notices_err.or(mobis_err);
+    let opensource_err = if !cli.no_opensource && cli.model.is_empty() {
+        let client = Arc::new(build_client(&cli.network, cli.network.proxy.clone())?);
+        let run = opensource::sync(&client, &root, &cli.brand, cli.plan, cli.concurrency.0.into(), cli.retries);
+        let result = tokio::select! {
+            r = run => r,
+            _ = ctrl_c() => {
+                eprintln!("Interrupted. Rerun the same command to resume.");
+                std::process::exit(130);
+            }
+        };
+
+        match result {
+            Ok(_) => None,
+            Err(e) if cli.plan => return Err(e),
+            Err(e) => {
+                warn!("Open-source downloads: {e:#}");
+                Some(e)
+            }
+        }
+    } else {
+        None
+    };
+    let notices_err = notices_err.or(mobis_err).or(opensource_err);
 
     let plan = make_plan(cli, &root).await?;
     let free = report(&plan, &root);
